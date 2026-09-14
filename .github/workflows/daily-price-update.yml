@@ -1,0 +1,39 @@
+name: Daily Pokémon Price Update
+
+on:
+  schedule:
+    # 13:17 UTC daily — arbitrary off-peak minute to avoid the top-of-hour
+    # crowd on GitHub's shared runners. Adjust to your timezone as needed.
+    - cron: "17 13 * * *"
+  workflow_dispatch: {}  # allows manual "Run workflow" from the Actions tab
+
+permissions:
+  contents: write  # needed to commit the updated CSVs back to the repo
+
+jobs:
+  fetch-prices:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch today's prices
+        env:
+          PKMNPRICES_API_KEY: ${{ secrets.PKMNPRICES_API_KEY }}
+        run: python scripts/fetch_prices.py
+
+      - name: Commit updated data
+        run: |
+          git config user.name "pkmnprices-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/
+          git diff --cached --quiet || git commit -m "Daily price update: $(date -u +'%Y-%m-%d')"
+          git push
