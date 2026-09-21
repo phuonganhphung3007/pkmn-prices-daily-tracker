@@ -8,11 +8,13 @@ each on the Free plan) and appends one CSV row per price entry returned
 Writes to:
   data/master_prices.csv        - full history, append-only
   data/snapshots/YYYY-MM-DD.csv - just today's rows, for easy diffing
+  BigQuery (when GCP_PROJECT_ID is set) - the system of record; see bq.py
 
 Resume support: if the job is interrupted (credit limit hit, network error,
 workflow timeout), data/.progress-YYYY-MM-DD.json remembers which card IDs
-were already fetched today, so re-running the same day picks up where it
-left off instead of re-spending credits on cards already collected.
+were already fetched today, and BigQuery is asked which IDs it already holds
+for today (the CI runner's local files don't survive between runs). Re-running
+the same day picks up where it left off instead of re-spending credits.
 """
 
 import csv
@@ -20,11 +22,15 @@ import json
 from datetime import date
 from pathlib import Path
 
+import bq
 from common import ApiClient, CreditBudgetExhausted, DATA_DIR, load_json, save_json
 
 WATCHLIST_PATH = Path(__file__).resolve().parent.parent / "config" / "watchlist.csv"
 MASTER_CSV = DATA_DIR / "master_prices.csv"
 SNAPSHOTS_DIR = DATA_DIR / "snapshots"
+
+# Flush to BigQuery every N cards so an interrupted run loses at most one batch.
+BQ_BATCH_SIZE = 50
 
 CSV_FIELDS = [
     "snapshot_date",
@@ -150,43 +156,62 @@ def main():
     progress_path = DATA_DIR / f".progress-{today}.json"
     done_ids = set(load_json(progress_path, []))
 
+    table = bq.PriceTable() if bq.is_enabled() else None
+    if table:
+        done_ids |= table.done_ids(today)
+    else:
+        print("GCP_PROJECT_ID not set; writing CSV only, skipping BigQuery.")
+
     watchlist = load_watchlist()
     print(f"Watchlist has {len(watchlist)} card(s); {len(done_ids)} already fetched today.")
 
     client = ApiClient()
     snapshot_path = SNAPSHOTS_DIR / f"{today}.csv"
 
+    pending: list[dict] = []  # rows fetched but not yet in BigQuery
+
+    def flush():
+        if table and pending:
+            table.load_rows(pending, today, replace=False)
+            pending.clear()
+
     fetched, failed = 0, 0
-    for entry in watchlist:
-        card_id = int(entry["id"])
-        if card_id in done_ids:
-            continue
+    try:
+        for entry in watchlist:
+            card_id = int(entry["id"])
+            if card_id in done_ids:
+                continue
 
-        try:
-            card = client.get(f"/cards/{card_id}")
-        except CreditBudgetExhausted as e:
-            print(f"Stopping — {e}")
-            break
-        except RuntimeError as e:
-            print(f"Skipping card {card_id}: {e}")
-            failed += 1
-            done_ids.add(card_id)  # don't retry a permanent error (e.g. 404) all day
+            try:
+                card = client.get(f"/cards/{card_id}")
+            except CreditBudgetExhausted as e:
+                print(f"Stopping — {e}")
+                break
+            except RuntimeError as e:
+                print(f"Skipping card {card_id}: {e}")
+                failed += 1
+                done_ids.add(card_id)  # don't retry a permanent error (e.g. 404) all day
+                save_json(progress_path, sorted(done_ids))
+                continue
+
+            rows = flatten_card(card, today)
+            append_rows(MASTER_CSV, rows)
+            append_rows(snapshot_path, rows)
+            pending.extend(rows)
+
+            done_ids.add(card_id)
             save_json(progress_path, sorted(done_ids))
-            continue
+            fetched += 1
 
-        rows = flatten_card(card, today)
-        append_rows(MASTER_CSV, rows)
-        append_rows(snapshot_path, rows)
-
-        done_ids.add(card_id)
-        save_json(progress_path, sorted(done_ids))
-        fetched += 1
-
-        if fetched % 50 == 0:
-            print(
-                f"  {fetched} cards fetched "
-                f"(credits used: {client.credits_charged_today}/{client.credits_limit})"
-            )
+            if fetched % BQ_BATCH_SIZE == 0:
+                flush()
+                print(
+                    f"  {fetched} cards fetched "
+                    f"(credits used: {client.credits_charged_today}/{client.credits_limit})"
+                )
+    finally:
+        # Also runs on errors/Ctrl-C so already-paid-for rows still land.
+        flush()
 
     print(
         f"Done. Fetched {fetched} card(s), {failed} failed/skipped, "

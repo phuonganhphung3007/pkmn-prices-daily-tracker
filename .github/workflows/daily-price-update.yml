@@ -8,7 +8,7 @@ on:
   workflow_dispatch: {}  # allows manual "Run workflow" from the Actions tab
 
 permissions:
-  contents: write  # needed to commit the updated CSVs back to the repo
+  contents: read  # BigQuery is the store now; nothing is committed back
 
 jobs:
   fetch-prices:
@@ -25,15 +25,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Fetch today's prices
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Fetch today's prices and load into BigQuery
         env:
           PKMNPRICES_API_KEY: ${{ secrets.PKMNPRICES_API_KEY }}
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
         run: python scripts/fetch_prices.py
-
-      - name: Commit updated data
-        run: |
-          git config user.name "pkmnprices-bot"
-          git config user.email "actions@users.noreply.github.com"
-          git add data/
-          git diff --cached --quiet || git commit -m "Daily price update: $(date -u +'%Y-%m-%d')"
-          git push
