@@ -156,9 +156,9 @@ def main():
     progress_path = DATA_DIR / f".progress-{today}.json"
     done_ids = set(load_json(progress_path, []))
 
-    table = bq.PriceTable() if bq.is_enabled() else None
-    if table:
-        done_ids |= table.done_ids(today)
+    store = bq.BigQueryStore() if bq.is_enabled() else None
+    if store:
+        done_ids |= store.done_card_ids(today)
     else:
         print("GCP_PROJECT_ID not set; writing CSV only, skipping BigQuery.")
 
@@ -171,8 +171,11 @@ def main():
     pending: list[dict] = []  # rows fetched but not yet in BigQuery
 
     def flush():
-        if table and pending:
-            table.load_rows(pending, today, replace=False)
+        if store and pending:
+            store.upsert_cards([bq.to_card_row(r) for r in pending])
+            store.load_price_history(
+                [bq.to_price_history_row(r) for r in pending], today, replace=False
+            )
             pending.clear()
 
     fetched, failed = 0, 0
