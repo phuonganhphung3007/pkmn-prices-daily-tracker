@@ -1,6 +1,6 @@
 # pkmnprices-tracker
 
-Daily Pokémon card price tracker built on the [pkmnprices.com](https://pkmnprices.com) API (Free plan). Collects TCGplayer (USD) prices for a watchlist of cards once a day via GitHub Actions and appends them to CSV.
+Daily Pokémon card price tracker built on the [pkmnprices.com](https://pkmnprices.com) API (Free plan). Collects TCGplayer (USD) prices for a watchlist of cards once a day via GitHub Actions and saves them to a SQLite database (plus CSV).
 
 ## How it works
 
@@ -10,9 +10,11 @@ scripts/build_watchlist.py  <- one-time/occasional: discover card IDs, add to wa
 scripts/fetch_prices.py     <- daily: GET /v1/cards/:id for each watchlisted card
 data/master_prices.csv      <- full append-only history, one row per price entry per day
 data/snapshots/YYYY-MM-DD.csv <- just that day's rows
-scripts/bq.py               <- BigQuery cards/price_history table setup + load helpers
-scripts/backfill_bigquery.py <- run anytime: load a local CSV (master or one snapshot) into BigQuery
-.github/workflows/daily-price-update.yml <- cron job: fetch_prices.py -> BigQuery
+data/pokemon.db             <- SQLite: cards + price_history tables
+scripts/db.py               <- SQLite table setup + save helpers
+scripts/backfill_db.py      <- load a local CSV (master or one snapshot) into pokemon.db
+scripts/sync_all_cards.py   <- fill pokemon.db with every card in the API (multi-day)
+.github/workflows/daily-price-update.yml <- cron job: fetch_prices.py -> pokemon.db, committed back
 ```
 
 Discovery (searching for cards) and daily collection (pricing cards you've already chosen) are **deliberately separate scripts**, because both `GET /v1/cards` (search) and `GET /v1/cards/:id` (detail) bill 1 credit per item returned. If discovery and collection were combined, you'd re-pay the search cost every single day. Splitting them means:
@@ -33,37 +35,35 @@ Discovery (searching for cards) and daily collection (pricing cards you've alrea
 4. Run a manual fetch to test: `python scripts/fetch_prices.py`
 5. For GitHub Actions: add `PKMNPRICES_API_KEY` as a repo secret (Settings → Secrets and variables → Actions), push this repo, and the workflow runs daily on its own (or trigger it manually from the Actions tab via "Run workflow").
 
-## BigQuery
+## SQLite database (`data/pokemon.db`)
 
-BigQuery is the system of record, split into two tables (see `data/pokemon.sql` for the original design):
+All data is saved in one SQLite file, `data/pokemon.db` (override with `PKMNPRICES_DB_PATH`). It's created on first run, needs no server or account, and is committed back to the repo by the daily workflow. Two tables, based on `data/pokemon.sql`:
 
-- `<project>.pkmnprices.cards` — one row per `card_id`, the latest known metadata (`name`, `card_number`, `rarity`, `card_type`, `set_id`, `tcg_player_id`). Upserted on every load: a card's row is updated in place, never duplicated.
-- `<project>.pkmnprices.price_history` — append-only, one row per `(card_id, price_date, condition, variant)`, same grain as a row in `master_prices.csv`. `price` is a `NUMERIC` (the API's `market_price`), `price_date` a `DATE`, `price_created_at` a `TIMESTAMP`. Partitioned by `price_date` and clustered by `card_id`; a snapshot is `WHERE price_date = '2026-09-15'`.
+- `cards`: one row per `card_id`, the latest known metadata (`name`, `card_number`, `rarity`, `card_type`, `set_id`, `tcg_player_id`). Upserted on every load, so a card's row is updated in place, never duplicated. A missing value in new data never overwrites a known one.
+- `price_history`: one row per `(card_id, price_date, source, condition, variant)`, the same grain as a row in `master_prices.csv`. `price` is the API's `market_price`, `price_date` is `YYYY-MM-DD`. Loading the same day again replaces rows instead of duplicating them.
 
-Both tables are created automatically on first run. Card upserts go through a small staging table + `MERGE`; price history goes through load jobs only. Neither needs a billing account — only streaming inserts (which this code never uses) require one on the free sandbox.
+If a run stops early (credit limit, error), the next run asks `price_history` which cards it already has for today and continues from there.
 
-**One-time setup**
+**Load existing CSV history** (safe to re-run):
+```
+python scripts/backfill_db.py --dry-run   # parse + count only
+python scripts/backfill_db.py             # loads data/master_prices.csv
+python scripts/backfill_db.py --file data/snapshots/2026-09-15.csv   # just one day
+```
 
-1. In [Google Cloud Console](https://console.cloud.google.com), create (or pick) a project and enable the BigQuery API. The free sandbox works.
-2. Create a service account with the roles **BigQuery Data Editor** and **BigQuery Job User**, then create a JSON key for it.
-3. In GitHub, add repo secrets `GCP_PROJECT_ID` and `GCP_SA_KEY` (the full contents of the JSON key), next to the existing `PKMNPRICES_API_KEY`.
-4. Locally: `pip install -r requirements.txt`, set `GCP_PROJECT_ID` in `.env`, and run `gcloud auth application-default login`.
-5. Backfill history once, straight from the local CSV — no GitHub workflow run needed (safe to re-run; cards are upserted and each day replaces its own price_history partition):
-   ```
-   python scripts/backfill_bigquery.py --dry-run   # parse + count only
-   python scripts/backfill_bigquery.py             # loads data/master_prices.csv
-   python scripts/backfill_bigquery.py --file data/snapshots/2026-09-15.csv   # just one day
-   ```
-
-After that, the daily workflow loads each run's rows into both tables, flushing every 50 cards. If a run stops early (credit limit, error), the next run asks `price_history` which cards it already has for today and continues from there. The workflow no longer commits `data/` to git.
+**Sync every card** the API knows about with `scripts/sync_all_cards.py`. It pages through `GET /v1/cards` and upserts every card into `cards`. Prices included in a list item go straight into `price_history`. Cards without prices are queued, and each one is fetched with `GET /v1/cards/:id`. On the Free plan the list never includes prices and the catalogue has ~28,700 cards, so a full sync costs about 2 credits per card and takes many days. Progress is saved in `data/.progress-sync-all.json`, so just re-run it until it prints "All cards synced."
+```
+python scripts/sync_all_cards.py --max-pages 1   # try one page
+python scripts/sync_all_cards.py                 # continue where it left off
+```
 
 Example: latest price per card and variant
 
 ```sql
 SELECT c.name, c.card_number, c.rarity, p.*
-FROM `your-project.pkmnprices.price_history` p
-JOIN `your-project.pkmnprices.cards` c USING (card_id)
-WHERE p.price_date = (SELECT MAX(price_date) FROM `your-project.pkmnprices.price_history`)
+FROM price_history p
+JOIN cards c USING (card_id)
+WHERE p.price_date = (SELECT MAX(price_date) FROM price_history);
 ```
 
 ## CSV schema (`data/master_prices.csv`)
@@ -104,8 +104,5 @@ Pro (20,000 credits/day) removes the coverage ceiling almost entirely — e.g. t
 ## Notes
 
 - Rate limiting (60/min on Free) is handled with exponential backoff in `common.py`; at 1 request per card this is very unlikely to be hit before the credit limit is.
-- The script still writes the local CSVs when run by hand (and with `GCP_PROJECT_ID` unset it works CSV-only). In CI they live only on the ephemeral runner.
+- Every run writes both `data/pokemon.db` and the CSVs; the workflow commits all of `data/` back to the repo.
 - `data/.progress-YYYY-MM-DD.json` is gitignored — it's a same-day resume aid, not meant to persist across days.
-#   p k m n - p r i c e s - d a i l y - t r a c k e r 
- 
- 

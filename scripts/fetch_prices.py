@@ -8,13 +8,14 @@ each on the Free plan) and appends one CSV row per price entry returned
 Writes to:
   data/master_prices.csv        - full history, append-only
   data/snapshots/YYYY-MM-DD.csv - just today's rows, for easy diffing
-  BigQuery (when GCP_PROJECT_ID is set) - the system of record; see bq.py
+  data/pokemon.db               - SQLite cards + price_history tables; see db.py
 
 Resume support: if the job is interrupted (credit limit hit, network error,
 workflow timeout), data/.progress-YYYY-MM-DD.json remembers which card IDs
-were already fetched today, and BigQuery is asked which IDs it already holds
-for today (the CI runner's local files don't survive between runs). Re-running
-the same day picks up where it left off instead of re-spending credits.
+were already fetched today, and pokemon.db is asked which IDs it already holds
+for today (the progress file doesn't survive between CI runs, but the committed
+database does). Re-running the same day picks up where it left off instead of
+re-spending credits.
 """
 
 import csv
@@ -22,15 +23,12 @@ import json
 from datetime import date
 from pathlib import Path
 
-import bq
+import db
 from common import ApiClient, CreditBudgetExhausted, DATA_DIR, load_json, save_json
 
 WATCHLIST_PATH = Path(__file__).resolve().parent.parent / "config" / "watchlist.csv"
 MASTER_CSV = DATA_DIR / "master_prices.csv"
 SNAPSHOTS_DIR = DATA_DIR / "snapshots"
-
-# Flush to BigQuery every N cards so an interrupted run loses at most one batch.
-BQ_BATCH_SIZE = 50
 
 CSV_FIELDS = [
     "snapshot_date",
@@ -156,27 +154,14 @@ def main():
     progress_path = DATA_DIR / f".progress-{today}.json"
     done_ids = set(load_json(progress_path, []))
 
-    store = bq.BigQueryStore() if bq.is_enabled() else None
-    if store:
-        done_ids |= store.done_card_ids(today)
-    else:
-        print("GCP_PROJECT_ID not set; writing CSV only, skipping BigQuery.")
+    store = db.Store()
+    done_ids |= store.done_card_ids(today)
 
     watchlist = load_watchlist()
     print(f"Watchlist has {len(watchlist)} card(s); {len(done_ids)} already fetched today.")
 
     client = ApiClient()
     snapshot_path = SNAPSHOTS_DIR / f"{today}.csv"
-
-    pending: list[dict] = []  # rows fetched but not yet in BigQuery
-
-    def flush():
-        if store and pending:
-            store.upsert_cards([bq.to_card_row(r) for r in pending])
-            store.load_price_history(
-                [bq.to_price_history_row(r) for r in pending], today, replace=False
-            )
-            pending.clear()
 
     fetched, failed = 0, 0
     try:
@@ -200,21 +185,19 @@ def main():
             rows = flatten_card(card, today)
             append_rows(MASTER_CSV, rows)
             append_rows(snapshot_path, rows)
-            pending.extend(rows)
+            store.save_flat_rows(rows)
 
             done_ids.add(card_id)
             save_json(progress_path, sorted(done_ids))
             fetched += 1
 
-            if fetched % BQ_BATCH_SIZE == 0:
-                flush()
+            if fetched % 50 == 0:
                 print(
                     f"  {fetched} cards fetched "
                     f"(credits used: {client.credits_charged_today}/{client.credits_limit})"
                 )
     finally:
-        # Also runs on errors/Ctrl-C so already-paid-for rows still land.
-        flush()
+        store.close()
 
     print(
         f"Done. Fetched {fetched} card(s), {failed} failed/skipped, "
