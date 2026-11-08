@@ -214,72 +214,91 @@ def append_rows(path: Path, rows: list[dict]):
         writer.writerows(rows)
 
 
-def main():
+def run(client: ApiClient, store: db.Store) -> dict:
+    """The watchlist price-history task: TCGplayer + eBay listings for every
+    not-yet-done card today. Stops early (without raising) if `client` runs
+    out of credits — either the real daily limit, or a soft per-task
+    allocation set via client.set_allocation() by an orchestrator sharing
+    today's budget across multiple tasks. Caller owns the Store's lifecycle."""
     today = date.today().isoformat()
     progress_path = DATA_DIR / f".progress-{today}.json"
     done_ids = set(load_json(progress_path, []))
-
-    store = db.Store()
     done_ids |= store.done_card_ids(today)
 
     watchlist = load_watchlist()
     print(f"Watchlist has {len(watchlist)} card(s); {len(done_ids)} already fetched today.")
 
-    client = ApiClient()
     snapshot_path = SNAPSHOTS_DIR / f"{today}.csv"
 
-    fetched, failed = 0, 0
-    try:
-        for entry in watchlist:
-            card_id = int(entry["id"])
-            if card_id in done_ids:
-                continue
+    fetched, failed, stopped_early = 0, 0, False
+    for entry in watchlist:
+        card_id = int(entry["id"])
+        if card_id in done_ids:
+            continue
 
-            try:
-                card = client.get(f"/cards/{card_id}")
-            except CreditBudgetExhausted as e:
-                print(f"Stopping — {e}")
-                break
-            except RuntimeError as e:
-                print(f"Skipping card {card_id}: {e}")
-                failed += 1
-                done_ids.add(card_id)  # don't retry a permanent error (e.g. 404) all day
-                save_json(progress_path, sorted(done_ids))
-                continue
+        try:
+            card = client.get(f"/cards/{card_id}")
+        except CreditBudgetExhausted as e:
+            print(f"Stopping price history — {e}")
+            stopped_early = True
+            break
+        except RuntimeError as e:
+            print(f"Skipping card {card_id}: {e}")
+            failed += 1
+            done_ids.add(card_id)  # don't retry a permanent error (e.g. 404) all day
+            save_json(progress_path, sorted(done_ids))
+            continue
 
-            rows = flatten_card(card, today)
-            append_rows(MASTER_CSV, rows)
-            append_rows(snapshot_path, rows)
-            store.save_flat_rows(rows)
+        rows = flatten_card(card, today)
+        append_rows(MASTER_CSV, rows)
+        append_rows(snapshot_path, rows)
+        store.save_flat_rows(rows)
 
-            try:
-                since = store.last_ebay_ingested_at(card_id)
-                listings = fetch_ebay_listings(client, card_id, since=since)
-            except CreditBudgetExhausted as e:
-                print(f"Stopping — {e}")
-                break
-            except RuntimeError as e:
-                print(f"Skipping eBay listings for card {card_id}: {e}")
-            else:
-                if listings:
-                    ebay_rows = flatten_ebay_listings(card_id, listings)
-                    store.save_prices([db.to_price_history_row(r) for r in ebay_rows])
-
+        try:
+            since = store.last_ebay_ingested_at(card_id)
+            listings = fetch_ebay_listings(client, card_id, since=since)
+        except CreditBudgetExhausted as e:
+            print(f"Stopping price history — {e}")
             done_ids.add(card_id)
             save_json(progress_path, sorted(done_ids))
-            fetched += 1
+            stopped_early = True
+            break
+        except RuntimeError as e:
+            print(f"Skipping eBay listings for card {card_id}: {e}")
+        else:
+            if listings:
+                ebay_rows = flatten_ebay_listings(card_id, listings)
+                store.save_prices([db.to_price_history_row(r) for r in ebay_rows])
 
-            if fetched % 50 == 0:
-                print(
-                    f"  {fetched} cards fetched "
-                    f"(credits used: {client.credits_charged_today}/{client.credits_limit})"
-                )
+        done_ids.add(card_id)
+        save_json(progress_path, sorted(done_ids))
+        fetched += 1
+
+        if fetched % 50 == 0:
+            print(
+                f"  {fetched} cards fetched "
+                f"(credits used: {client.credits_charged_today}/{client.credits_limit})"
+            )
+
+    return {
+        "fetched": fetched,
+        "failed": failed,
+        "remaining": max(0, len(watchlist) - len(done_ids)),
+        "stopped_early": stopped_early,
+    }
+
+
+def main():
+    store = db.Store()
+    client = ApiClient()
+    try:
+        stats = run(client, store)
     finally:
         store.close()
 
     print(
-        f"Done. Fetched {fetched} card(s), {failed} failed/skipped, "
-        f"{len(watchlist) - len(done_ids)} remaining for a future run. "
+        f"Done. Fetched {stats['fetched']} card(s), {stats['failed']} failed/skipped, "
+        f"{stats['remaining']} remaining for a future run. "
         f"Credits used today: {client.credits_charged_today}/{client.credits_limit}."
     )
 

@@ -7,20 +7,40 @@ Daily Pokémon card price tracker built on the [pkmnprices.com](https://pkmnpric
 ```
 config/watchlist.csv        <- cards you're tracking (id, tcg_player_id, name, set_name)
 scripts/build_watchlist.py  <- one-time/occasional: discover card IDs, add to watchlist
-scripts/fetch_prices.py     <- daily: GET /v1/cards/:id for each watchlisted card
-data/master_prices.csv      <- full append-only history, one row per price entry per day
-data/snapshots/YYYY-MM-DD.csv <- just that day's rows
+scripts/daily_sync.py       <- daily entry point: splits today's credits across the two tasks below
+scripts/fetch_prices.py     <- task: GET /v1/cards/:id + /listings/ebay for each watchlisted card
+scripts/sync_all_cards.py   <- task: fill pokemon.db with every card in the API (multi-day)
+data/master_prices.csv      <- full append-only TCGplayer history, one row per price entry per day
+data/snapshots/YYYY-MM-DD.csv <- just that day's TCGplayer rows
 data/pokemon.db             <- SQLite: cards + price_history tables
 scripts/db.py               <- SQLite table setup + save helpers
 scripts/backfill_db.py      <- load a local CSV (master or one snapshot) into pokemon.db
-scripts/sync_all_cards.py   <- fill pokemon.db with every card in the API (multi-day)
-.github/workflows/daily-price-update.yml <- cron job: fetch_prices.py -> pokemon.db, committed back
+.github/workflows/daily-price-update.yml <- cron job: daily_sync.py -> pokemon.db, committed back
 ```
 
 Discovery (searching for cards) and daily collection (pricing cards you've already chosen) are **deliberately separate scripts**, because both `GET /v1/cards` (search) and `GET /v1/cards/:id` (detail) bill 1 credit per item returned. If discovery and collection were combined, you'd re-pay the search cost every single day. Splitting them means:
 
 - You pay the search/discovery cost once per card, ever.
-- The daily job's cost is exactly `1 credit × watchlist size` — fully predictable.
+- The watchlist task's cost is `(1 + eBay listings returned) × watchlist size` — predictable day to day once each card's eBay history has been backfilled once.
+
+### `scripts/daily_sync.py` — the daily entry point
+
+Two tasks compete for the same daily credit pool, with different urgency: catalog growth (`sync_all_cards.py`) can spill over for days without hurting anything, but price history (`fetch_prices.py`) needs to run *every* day to be worth having. Just running catalog growth until it runs out of credits — the naive approach — can burn the entire day's budget on catalog growth alone and leave nothing for that day's price refresh.
+
+`daily_sync.py` fixes that by querying today's real remaining credit pool once, then splitting it:
+
+1. **Catalog growth** (priority 1) gets first claim on a share of the pool — `--catalog-share`, default 50% (`PKMNPRICES_CATALOG_SHARE` env var) — and is hard-capped there even if it would otherwise keep going.
+2. **Price history** (priority 2) gets the rest of the pool, plus whatever catalog growth didn't spend (e.g. because it finished a page run early, or is already fully caught up).
+
+Both tasks remain independently resumable (their own progress files / DB state), so this is just how *today's* budget gets divided between them — run it daily (the GitHub Actions workflow already does) and each day picks up exactly where the previous one left off for both tasks.
+
+```
+python scripts/daily_sync.py                      # the daily cron entry point
+python scripts/daily_sync.py --catalog-share 0.3    # give catalog growth 30% instead of 50%
+python scripts/daily_sync.py --max-pages 20         # also cap catalog list pages this run
+```
+
+`fetch_prices.py` and `sync_all_cards.py` are still runnable directly (e.g. for a one-off manual fetch or to let one task use the *entire* day's budget) — each only self-limits to the real account-wide daily cap when run on its own.
 
 ## Setup
 
@@ -32,7 +52,7 @@ Discovery (searching for cards) and daily collection (pricing cards you've alrea
    python scripts/build_watchlist.py --name "Charizard"
    python scripts/build_watchlist.py --tcg-player-id 519184
    ```
-4. Run a manual fetch to test: `python scripts/fetch_prices.py`
+4. Run a manual fetch to test: `python scripts/daily_sync.py` (or `python scripts/fetch_prices.py` for just the watchlist task, skipping catalog growth)
 5. For GitHub Actions: add `PKMNPRICES_API_KEY` as a repo secret (Settings → Secrets and variables → Actions), push this repo, and the workflow runs daily on its own (or trigger it manually from the Actions tab via "Run workflow").
 
 ## SQLite database (`data/pokemon.db`)

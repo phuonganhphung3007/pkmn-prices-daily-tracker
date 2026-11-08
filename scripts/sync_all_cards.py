@@ -136,19 +136,24 @@ def detail_phase(client, writer, progress, done_ids):
     print(f"Detail phase: {fetched} fetched, {failed} failed, {len(progress['detail_queue'])} left in queue.")
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--max-pages", type=int, default=None, help="cap list pages fetched this run")
-    ap.add_argument("--list-only", action="store_true", help="skip the one-by-one detail phase")
-    ap.add_argument("--restart", action="store_true", help="discard saved progress first")
-    args = ap.parse_args()
-
-    if args.restart and PROGRESS_PATH.exists():
+def run(
+    client: ApiClient,
+    store: db.Store,
+    max_pages: int | None = None,
+    list_only: bool = False,
+    restart: bool = False,
+) -> dict:
+    """The catalog-growth task: page the full card list into `cards`, then
+    (unless list_only) fetch + store prices one by one for cards the list
+    didn't already include prices for. Stops early (without raising) if
+    `client` runs out of credits — either the real daily limit, or a soft
+    per-task allocation set via client.set_allocation() by an orchestrator
+    sharing today's budget across multiple tasks. Caller owns the Store's
+    lifecycle."""
+    if restart and PROGRESS_PATH.exists():
         PROGRESS_PATH.unlink()
     progress = load_progress()
     today = date.today().isoformat()
-
-    store = db.Store()
     done_ids = store.done_card_ids(today)
 
     print(
@@ -157,19 +162,37 @@ def main():
         f"{len(done_ids)} already priced today."
     )
 
-    client = ApiClient()
     writer = Writer(store, today)
+    keep_going = list_phase(client, writer, progress, done_ids, max_pages)
+    if keep_going and not list_only:
+        detail_phase(client, writer, progress, done_ids)
 
+    finished = progress["list_done"] and not progress["detail_queue"]
+    if finished:
+        print("All cards synced.")
+        PROGRESS_PATH.unlink(missing_ok=True)
+
+    return {
+        "list_done": progress["list_done"],
+        "detail_queue_len": len(progress["detail_queue"]),
+        "finished": finished,
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--max-pages", type=int, default=None, help="cap list pages fetched this run")
+    ap.add_argument("--list-only", action="store_true", help="skip the one-by-one detail phase")
+    ap.add_argument("--restart", action="store_true", help="discard saved progress first")
+    args = ap.parse_args()
+
+    store = db.Store()
+    client = ApiClient()
     try:
-        keep_going = list_phase(client, writer, progress, done_ids, args.max_pages)
-        if keep_going and not args.list_only:
-            detail_phase(client, writer, progress, done_ids)
+        run(client, store, max_pages=args.max_pages, list_only=args.list_only, restart=args.restart)
     finally:
         store.close()
 
-    if progress["list_done"] and not progress["detail_queue"]:
-        print("All cards synced.")
-        PROGRESS_PATH.unlink(missing_ok=True)
     print(f"Credits used today: {client.credits_charged_today}/{client.credits_limit}.")
 
 

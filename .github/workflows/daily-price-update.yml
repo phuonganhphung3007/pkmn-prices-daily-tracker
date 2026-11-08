@@ -25,10 +25,10 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Fetch today's prices into data/pokemon.db
+      - name: Sync catalog + fetch today's prices into data/pokemon.db
         env:
           PKMNPRICES_API_KEY: ${{ secrets.PKMNPRICES_API_KEY }}
-        run: python scripts/fetch_prices.py
+        run: python scripts/daily_sync.py
 
       - name: Commit updated data
         run: |

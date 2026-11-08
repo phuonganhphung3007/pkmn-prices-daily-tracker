@@ -3,9 +3,11 @@ Shared helpers for the pkmnprices.com daily tracker.
 
 Handles:
 - API auth (x-api-key)
-- Credit-budget tracking against the Free plan's 500 credits/day
-  (read live from the x-credits-charged / x-credits-limit response headers,
-  since the JWT-only /v1/usage endpoint isn't reachable with an API key)
+- Credit-budget tracking against the plan's daily credit limit (read live
+  from the x-credits-remaining / x-credits-limit response headers, since the
+  JWT-only /v1/usage endpoint isn't reachable with an API key). Note:
+  x-credits-charged is the cost of that one request, not a cumulative daily
+  total, despite its name — don't use it for budget tracking.
 - Rate-limit-aware retries (429 credit_limit_exceeded vs 429 rate_limit_exceeded)
 """
 
@@ -52,34 +54,63 @@ class ApiClient:
         self.session.headers.update({"x-api-key": self.api_key})
         self.credits_charged_today = 0
         self.credits_limit = DAILY_CREDIT_LIMIT
+        self._allocation: int | None = None
+        self._allocation_baseline = 0
+
+    def set_allocation(self, credits: int):
+        """Caps how many credits this client may spend from now on, on top
+        of (not instead of) the real account-wide daily limit. For an
+        orchestrator (daily_sync.py) splitting one day's credit pool across
+        several tasks that share a client — call again with a new figure to
+        switch the cap to the next task."""
+        self._allocation = max(0, credits)
+        self._allocation_baseline = self.credits_charged_today
+
+    def allocation_spent(self) -> int:
+        return max(0, self.credits_charged_today - self._allocation_baseline)
+
+    def allocation_remaining(self) -> int | None:
+        if self._allocation is None:
+            return None
+        return max(0, self._allocation - self.allocation_spent())
 
     def _update_budget_from_headers(self, headers):
-        # These headers reflect the server's own daily counter, so trust them
-        # over any local estimate once they show up.
-        charged = headers.get("x-credits-charged")
+        # x-credits-remaining is the server's own cumulative daily counter;
+        # x-credits-charged is only the cost of this one request (confirmed
+        # empirically — it does not accumulate across calls), so it's not
+        # usable for budget tracking despite the name.
         limit = headers.get("x-credits-limit")
-        if charged is not None:
-            try:
-                self.credits_charged_today = int(charged)
-            except ValueError:
-                pass
+        remaining = headers.get("x-credits-remaining")
         if limit is not None:
             try:
                 self.credits_limit = int(limit)
             except ValueError:
                 pass
+        if remaining is not None:
+            try:
+                self.credits_charged_today = self.credits_limit - int(remaining)
+            except ValueError:
+                pass
 
     def remaining_credits(self) -> int:
-        return max(0, self.credits_limit - self.credits_charged_today)
+        real = max(0, self.credits_limit - self.credits_charged_today)
+        allocated = self.allocation_remaining()
+        return real if allocated is None else min(real, allocated)
 
     def get(self, path: str, params: dict | None = None, max_retries: int = 5):
         """
         GET request with:
-        - a pre-flight budget check (refuses to spend past the safety buffer)
+        - a pre-flight budget check (refuses to spend past the safety buffer,
+          or past this client's task allocation if one is set)
         - exponential backoff on 429 rate_limit_exceeded
         - a hard stop on 429 credit_limit_exceeded (no point retrying)
         """
         if self.remaining_credits() <= CREDIT_SAFETY_BUFFER:
+            allocated = self.allocation_remaining()
+            if allocated is not None and allocated <= CREDIT_SAFETY_BUFFER:
+                raise CreditBudgetExhausted(
+                    f"Task allocation reached ({self.allocation_spent()}/{self._allocation} credits spent)."
+                )
             raise CreditBudgetExhausted(
                 f"Only {self.remaining_credits()} credits left today "
                 f"(buffer is {CREDIT_SAFETY_BUFFER}). Stopping before the next call."
