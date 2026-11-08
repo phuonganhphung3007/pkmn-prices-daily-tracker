@@ -39,10 +39,20 @@ Discovery (searching for cards) and daily collection (pricing cards you've alrea
 
 All data is saved in one SQLite file, `data/pokemon.db` (override with `PKMNPRICES_DB_PATH`). It's created on first run, needs no server or account, and is committed back to the repo by the daily workflow. Two tables, based on `data/pokemon.sql`:
 
-- `cards`: one row per `card_id`, the latest known metadata (`name`, `card_number`, `rarity`, `card_type`, `set_id`, `tcg_player_id`). Upserted on every load, so a card's row is updated in place, never duplicated. A missing value in new data never overwrites a known one.
-- `price_history`: one row per `(card_id, price_date, source, condition, variant)`, the same grain as a row in `master_prices.csv`. `price` is the API's `market_price`, `price_date` is `YYYY-MM-DD`. Loading the same day again replaces rows instead of duplicating them.
+- `cards`: one row per `card_id`, the latest known metadata (`name`, `card_number`, `rarity`, `card_type`, `set_id`, `tcg_player_id`). Upserted on every load, so a card's row is updated in place, never duplicated. A missing value in new data never overwrites a known one. It never holds grade or price fields — a card can have zero, one, or many `price_history` rows, graded or not.
+- `price_history`: holds two different grains, told apart by `price_source`:
+  - `tcgplayer`: one row per `(card_id, price_date, condition, variant)`, the same grain as a row in `master_prices.csv` — a daily aggregate `market_price`. Loading the same day again replaces the row instead of duplicating it.
+  - `ebay`: one row per individual sold listing from `GET /cards/:id/listings/ebay` (Pro+). `external_id` (the listing's own id) is the real dedup key here, not the date — a card routinely has several eBay rows for the same day, and even several at the same grade, because each is a distinct sale (e.g. three separate PSA 10 sales at different prices). `grader`, `grade`, `grade_qualifier`, `sale_type`, and `listing_url` are only ever populated on these rows; they're always `NULL` on `tcgplayer` rows, which have no notion of grading.
 
-If a run stops early (credit limit, error), the next run asks `price_history` which cards it already has for today and continues from there.
+  `price` is the API's `market_price` for `tcgplayer` rows or a sale price for `ebay` rows; `price_date` is `YYYY-MM-DD` — the snapshot date for `tcgplayer`, the listing's own `sold_at` for `ebay`.
+
+An existing `pokemon.db` created before these grading columns existed is migrated in place the first time `db.Store()` runs against it (`ALTER TABLE ... ADD COLUMN`, then the unique index is rebuilt) — no manual steps needed.
+
+If a run stops early (credit limit, error), the next run asks `price_history` which cards it already has for today and continues from there. eBay fetching resumes separately and incrementally: each card's `since` cursor is the newest `ingested_at` already stored for it, so a later run only pays credits for listings added after the last one it saw.
+
+**How many grades does a card have?** It varies, and that's by design — the schema never assumes one grade per card:
+- A `tcgplayer` row is always ungraded (raw market price), one row per condition/variant/day.
+- An `ebay` row can be anything from zero (no graded sales yet) to dozens — different graders, different grades, or several sales at the identical grade. All of them key off the same `card_id`, so querying "every grade ever seen for this card" is just `SELECT DISTINCT grader, grade, grade_qualifier FROM price_history WHERE card_id = ? AND price_source = 'ebay'`.
 
 **Load existing CSV history** (safe to re-run):
 ```
@@ -80,26 +90,19 @@ One row per `(card, price entry, day)`. A card with 5 TCGplayer condition/varian
 | `price_source`, `price_currency`, `price_condition`, `price_variant`, `market_price`, `price_created_at` | one row's worth of the `prices[]` array |
 | `raw_json` | the full API response for that card, for debugging/recovering fields not yet mapped to a column |
 
-## Free plan: coverage and limits
+## Plan: coverage and limits
 
-**Credits:** 500/day, reset daily, 60 requests/min, 1 key. Every `GET /v1/cards/:id` call costs 1 credit (single item returned).
+This repo now runs on **Pro** (20,000 credits/day). `common.py`'s `DAILY_CREDIT_LIMIT` still defaults to 500 (the Free-plan value) but self-corrects on the first request of the day from the live `x-credits-limit` response header, so no `.env` change is required — set `PKMNPRICES_DAILY_LIMIT=20000` only if you want the pre-flight check to know the real ceiling before that first call.
 
-**Daily coverage:** with a 10-credit safety buffer built into `common.py`, the daily job can fetch **up to ~490 cards per day**, one credit each. That's a hard ceiling on the Free plan — a bigger watchlist just means the job stops partway through and picks up the rest on the next run (resume is automatic via the per-day progress file).
+**Daily coverage:** `GET /v1/cards/:id` costs 1 credit/card; `GET /v1/cards/:id/listings/ebay` costs 1 credit per listing returned (up to 20/page). A watchlist of a few hundred cards, each with a handful of new eBay comps a day, comfortably fits in the 20,000/day budget — the daily job stops early and resumes on the next run if it ever doesn't.
 
-**Discovery cost is separate and comes out of the same 500/day pool.** Building a watchlist via `GET /v1/cards` also bills 1 credit per item returned, at up to 100 per page. Searching a 250-card set to seed the watchlist costs ~250 credits *that day*, leaving only ~250 for the daily fetch run on the same day. For large watchlists, either spread discovery across a few days or run it a day before you need full daily coverage.
+**Discovery cost is separate and comes out of the same pool.** Building a watchlist via `GET /v1/cards` also bills 1 credit per item returned, at up to 100 per page.
 
-**What the Free plan cannot fetch at all** (all return `403`):
-- Cardmarket / EUR prices — the `prices[]` array only ever contains `tcgplayer`/USD rows; German-language cards have *no* USD pricing, so they're effectively untrackable on Free.
-- Japanese or German cards — `language=Japanese`/`German` is rejected outright; only English cards are servable.
-- Price history (`/cards/:id/prices/history`) — this repo's own `master_prices.csv` becomes your history instead, built up one day at a time.
-- Any listings endpoint (`/listings/ebay`, `/listings/cardmarket`, `/listings/tcgplayer`) — no live marketplace offers or eBay sold comps.
-- Sealed products (`/sealed`, `/sealed/:id`, and their sub-endpoints) — booster boxes, ETBs, etc. are Pro+ only.
-
-Everything else on `GET /v1/cards/:id` — all the requested fields, plus `stage`, `card_type`, `ability`, `attacks`, `cardmarket_url`/`cardmarket_product_id` mapping IDs, etc. — is returned in full on Free; it's specifically EUR pricing, non-English cards, history, listings, and sealed products that are gated.
-
-### If you outgrow Free
-
-Pro (20,000 credits/day) removes the coverage ceiling almost entirely — e.g. tracking 5,000 cards daily costs 5,000 credits, well inside budget — and unlocks EUR prices, Japanese/German cards, price history (so you could stop rolling your own), and listings/sealed data.
+**What's now available on Pro** (previously `403` on Free):
+- EUR / Cardmarket prices, and Japanese/German cards.
+- Price history (`/cards/:id/prices/history`) — not wired up here, since `master_prices.csv` + `price_history` already build this repo's own history day by day.
+- `GET /cards/:id/listings/ebay` — eBay sold comps, including PSA/BGS/CGC graded sales. `fetch_prices.py` now calls this for every watchlisted card alongside the TCGplayer fetch; see the SQLite section above for how graded rows are stored.
+- Sealed products (`/sealed`, `/sealed/:id`, `/sealed/:id/listings/ebay`) — not wired up here; the watchlist/tracker is card-only for now.
 
 ## Notes
 

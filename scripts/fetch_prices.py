@@ -2,12 +2,16 @@
 Daily price collection job.
 
 For every card in config/watchlist.csv, calls GET /v1/cards/:id (1 credit
-each on the Free plan) and appends one CSV row per price entry returned
-(a card with 5 TCGplayer condition/variant rows produces 5 output rows).
+each) and appends one CSV row per TCGplayer price entry returned (a card with
+5 condition/variant rows produces 5 output rows). It then also calls
+GET /v1/cards/:id/listings/ebay (1 credit per listing returned, Pro+ only)
+and stores every eBay sold comp — including PSA/BGS/CGC graded sales — into
+pokemon.db's price_history table. eBay rows aren't written to the CSVs, only
+to the DB (see db.py's module docstring for why they need a different grain).
 
 Writes to:
-  data/master_prices.csv        - full history, append-only
-  data/snapshots/YYYY-MM-DD.csv - just today's rows, for easy diffing
+  data/master_prices.csv        - full TCGplayer history, append-only
+  data/snapshots/YYYY-MM-DD.csv - just today's TCGplayer rows, for easy diffing
   data/pokemon.db               - SQLite cards + price_history tables; see db.py
 
 Resume support: if the job is interrupted (credit limit hit, network error,
@@ -15,7 +19,9 @@ workflow timeout), data/.progress-YYYY-MM-DD.json remembers which card IDs
 were already fetched today, and pokemon.db is asked which IDs it already holds
 for today (the progress file doesn't survive between CI runs, but the committed
 database does). Re-running the same day picks up where it left off instead of
-re-spending credits.
+re-spending credits. eBay fetches resume separately and incrementally: each
+card's `since` is the newest ingested_at already stored for it, so a later run
+only pays for listings added after the last one it saw.
 """
 
 import csv
@@ -29,6 +35,12 @@ from common import ApiClient, CreditBudgetExhausted, DATA_DIR, load_json, save_j
 WATCHLIST_PATH = Path(__file__).resolve().parent.parent / "config" / "watchlist.csv"
 MASTER_CSV = DATA_DIR / "master_prices.csv"
 SNAPSHOTS_DIR = DATA_DIR / "snapshots"
+
+EBAY_PAGE_LIMIT = 20
+# Safety cap so one card with an unexpectedly long eBay sales history can't
+# loop forever / blow the daily credit budget on its own; a card past this
+# cap just picks up the rest via `since` on a later run.
+EBAY_MAX_PAGES = 50
 
 CSV_FIELDS = [
     "snapshot_date",
@@ -139,6 +151,59 @@ def flatten_card(card: dict, today: str) -> list[dict]:
     return rows
 
 
+def fetch_ebay_listings(client: ApiClient, card_id: int, since: str | None = None) -> list[dict]:
+    """Pages GET /cards/:id/listings/ebay (1 credit per listing returned).
+    `since` filters on the API's own ingested_at, so passing the newest
+    ingested_at we already have in the DB fetches only what's new."""
+    params = {"sort": "date_desc", "limit": EBAY_PAGE_LIMIT}
+    if since:
+        params["since"] = since
+
+    listings: list[dict] = []
+    cursor = None
+    for _ in range(EBAY_MAX_PAGES):
+        page_params = dict(params)
+        if cursor:
+            page_params["cursor"] = cursor
+        resp = client.get(f"/cards/{card_id}/listings/ebay", params=page_params)
+        listings.extend(resp.get("data") or [])
+        pagination = resp.get("pagination") or {}
+        if not pagination.get("has_more"):
+            break
+        cursor = pagination.get("next_cursor")
+        if not cursor:
+            break
+    return listings
+
+
+def flatten_ebay_listings(card_id: int, listings: list[dict]) -> list[dict]:
+    """One row per eBay sold listing, in the same flat-row shape fetch_card
+    rows use, ready for db.to_price_history_row. price_date is the listing's
+    own sold_at (not today) since these are historical individual sales, not
+    a daily aggregate like tcgplayer's market_price."""
+    rows = []
+    for item in listings:
+        rows.append(
+            {
+                "id": card_id,
+                "price_date": item.get("sold_at"),
+                "price_source": "ebay",
+                "price_currency": item.get("currency"),
+                "price_condition": None,
+                "price_variant": item.get("variant"),
+                "market_price": item.get("price"),
+                "price_created_at": item.get("ingested_at"),
+                "sale_type": item.get("sale_type"),
+                "grader": item.get("grader"),
+                "grade": item.get("grade"),
+                "grade_qualifier": item.get("grade_qualifier"),
+                "listing_url": item.get("listing_url"),
+                "external_id": item.get("id"),
+            }
+        )
+    return rows
+
+
 def append_rows(path: Path, rows: list[dict]):
     path.parent.mkdir(parents=True, exist_ok=True)
     write_header = not path.exists()
@@ -186,6 +251,19 @@ def main():
             append_rows(MASTER_CSV, rows)
             append_rows(snapshot_path, rows)
             store.save_flat_rows(rows)
+
+            try:
+                since = store.last_ebay_ingested_at(card_id)
+                listings = fetch_ebay_listings(client, card_id, since=since)
+            except CreditBudgetExhausted as e:
+                print(f"Stopping — {e}")
+                break
+            except RuntimeError as e:
+                print(f"Skipping eBay listings for card {card_id}: {e}")
+            else:
+                if listings:
+                    ebay_rows = flatten_ebay_listings(card_id, listings)
+                    store.save_prices([db.to_price_history_row(r) for r in ebay_rows])
 
             done_ids.add(card_id)
             save_json(progress_path, sorted(done_ids))
