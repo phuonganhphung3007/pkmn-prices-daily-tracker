@@ -3,3 +3,9 @@ __pycache__/
 *.pyc
 .venv/
 data/.progress-*.json
+
+# Dropped in favor of pokemon.db only: an unbounded, forever-growing,
+# git-committed CSV (raw_json repeated on every price-entry row) produced a
+# 100MB+ blob in this repo's history and broke the daily workflow's push.
+data/master_prices.csv
+data/snapshots/*.csv

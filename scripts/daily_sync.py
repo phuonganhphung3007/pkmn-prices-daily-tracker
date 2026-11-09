@@ -59,6 +59,9 @@ def main():
         except CreditBudgetExhausted as e:
             print(f"No credits left to even start today — {e}")
             return
+        except RuntimeError as e:
+            print(f"Couldn't reach the API to start today's run — {e}")
+            return
         pool = client.remaining_credits()
         catalog_budget = int(pool * args.catalog_share)
         price_budget = pool - catalog_budget

@@ -1,6 +1,6 @@
 # pkmnprices-tracker
 
-Daily Pokémon card price tracker built on the [pkmnprices.com](https://pkmnprices.com) API (Free plan). Collects TCGplayer (USD) prices for a watchlist of cards once a day via GitHub Actions and saves them to a SQLite database (plus CSV).
+Daily Pokémon card price tracker built on the [pkmnprices.com](https://pkmnprices.com) API (Pro plan). Collects TCGplayer (USD) prices and eBay sold comps (including PSA/BGS/CGC graded sales) for a watchlist of cards once a day via GitHub Actions and saves them to a SQLite database.
 
 ## How it works
 
@@ -10,13 +10,13 @@ scripts/build_watchlist.py  <- one-time/occasional: discover card IDs, add to wa
 scripts/daily_sync.py       <- daily entry point: splits today's credits across the two tasks below
 scripts/fetch_prices.py     <- task: GET /v1/cards/:id + /listings/ebay for each watchlisted card
 scripts/sync_all_cards.py   <- task: fill pokemon.db with every card in the API (multi-day)
-data/master_prices.csv      <- full append-only TCGplayer history, one row per price entry per day
-data/snapshots/YYYY-MM-DD.csv <- just that day's TCGplayer rows
 data/pokemon.db             <- SQLite: cards + price_history tables
 scripts/db.py               <- SQLite table setup + save helpers
-scripts/backfill_db.py      <- load a local CSV (master or one snapshot) into pokemon.db
+scripts/backfill_db.py      <- one-off: load an old master_prices.csv export into pokemon.db
 .github/workflows/daily-price-update.yml <- cron job: daily_sync.py -> pokemon.db, committed back
 ```
+
+**No CSVs are written anymore** — `pokemon.db` is the only output. This repo used to also append every row to `data/master_prices.csv` and `data/snapshots/YYYY-MM-DD.csv`, but that CSV is pure append-only (it never shrinks) and had the full raw API response duplicated on *every single price-entry row*; historical versions of it in this repo's git history grew past 100MB, which GitHub rejects on push. The DB doesn't have this problem — rows are upserted/deduplicated rather than appended forever.
 
 Discovery (searching for cards) and daily collection (pricing cards you've already chosen) are **deliberately separate scripts**, because both `GET /v1/cards` (search) and `GET /v1/cards/:id` (detail) bill 1 credit per item returned. If discovery and collection were combined, you'd re-pay the search cost every single day. Splitting them means:
 
@@ -61,7 +61,7 @@ All data is saved in one SQLite file, `data/pokemon.db` (override with `PKMNPRIC
 
 - `cards`: one row per `card_id`, the latest known metadata (`name`, `card_number`, `rarity`, `card_type`, `set_id`, `tcg_player_id`). Upserted on every load, so a card's row is updated in place, never duplicated. A missing value in new data never overwrites a known one. It never holds grade or price fields — a card can have zero, one, or many `price_history` rows, graded or not.
 - `price_history`: holds two different grains, told apart by `price_source`:
-  - `tcgplayer`: one row per `(card_id, price_date, condition, variant)`, the same grain as a row in `master_prices.csv` — a daily aggregate `market_price`. Loading the same day again replaces the row instead of duplicating it.
+  - `tcgplayer`: one row per `(card_id, price_date, condition, variant)` — a daily aggregate `market_price`. Loading the same day again replaces the row instead of duplicating it.
   - `ebay`: one row per individual sold listing from `GET /cards/:id/listings/ebay` (Pro+). `external_id` (the listing's own id) is the real dedup key here, not the date — a card routinely has several eBay rows for the same day, and even several at the same grade, because each is a distinct sale (e.g. three separate PSA 10 sales at different prices). `grader`, `grade`, `grade_qualifier`, `sale_type`, and `listing_url` are only ever populated on these rows; they're always `NULL` on `tcgplayer` rows, which have no notion of grading.
 
   `price` is the API's `market_price` for `tcgplayer` rows or a sale price for `ebay` rows; `price_date` is `YYYY-MM-DD` — the snapshot date for `tcgplayer`, the listing's own `sold_at` for `ebay`.
@@ -74,14 +74,14 @@ If a run stops early (credit limit, error), the next run asks `price_history` wh
 - A `tcgplayer` row is always ungraded (raw market price), one row per condition/variant/day.
 - An `ebay` row can be anything from zero (no graded sales yet) to dozens — different graders, different grades, or several sales at the identical grade. All of them key off the same `card_id`, so querying "every grade ever seen for this card" is just `SELECT DISTINCT grader, grade, grade_qualifier FROM price_history WHERE card_id = ? AND price_source = 'ebay'`.
 
-**Load existing CSV history** (safe to re-run):
+**Importing an old CSV export** (e.g. from before CSVs were dropped, or a `master_prices.csv` someone hands you) — safe to re-run:
 ```
 python scripts/backfill_db.py --dry-run   # parse + count only
-python scripts/backfill_db.py             # loads data/master_prices.csv
-python scripts/backfill_db.py --file data/snapshots/2026-09-15.csv   # just one day
+python scripts/backfill_db.py --file path/to/master_prices.csv
+python scripts/backfill_db.py --file path/to/a-snapshot.csv   # just one day
 ```
 
-**Sync every card** the API knows about with `scripts/sync_all_cards.py`. It pages through `GET /v1/cards` and upserts every card into `cards`. Prices included in a list item go straight into `price_history`. Cards without prices are queued, and each one is fetched with `GET /v1/cards/:id`. On the Free plan the list never includes prices and the catalogue has ~28,700 cards, so a full sync costs about 2 credits per card and takes many days. Progress is saved in `data/.progress-sync-all.json`, so just re-run it until it prints "All cards synced."
+**Sync every card** the API knows about with `scripts/sync_all_cards.py`. It pages through `GET /v1/cards` and upserts every card into `cards`. Prices included in a list item go straight into `price_history`. Cards without prices are queued, and each one is fetched with `GET /v1/cards/:id`. The catalogue has ~93,000 cards and list items never include prices even on Pro, so a full sync costs ~2 credits per card and takes many days. Progress is saved in `data/.progress-sync-all.json`, so just re-run it until it prints "All cards synced."
 ```
 python scripts/sync_all_cards.py --max-pages 1   # try one page
 python scripts/sync_all_cards.py                 # continue where it left off
@@ -96,20 +96,6 @@ JOIN cards c USING (card_id)
 WHERE p.price_date = (SELECT MAX(price_date) FROM price_history);
 ```
 
-## CSV schema (`data/master_prices.csv`)
-
-One row per `(card, price entry, day)`. A card with 5 TCGplayer condition/variant combinations produces 5 rows per day it's fetched.
-
-| Column | Source |
-|---|---|
-| `snapshot_date` | date the row was collected |
-| `id`, `tcg_player_id`, `name`, `number`, `total_set_number`, `rarity`, `artist`, `image_url` | card identity fields |
-| `set_id`, `set_name` | from the nested `set` object |
-| `stage`, `card_type`, `hp`, `weakness`, `resistance`, `retreat_cost`, `energy_type`, `ability`, `flavor_text`, `attacks` | TCGplayer-sourced attributes (often null for Trainers/Energy/older cards) |
-| `cardmarket_url`, `cardmarket_product_id` | Cardmarket mapping identifiers (may be null; unrelated to plan tier) |
-| `price_source`, `price_currency`, `price_condition`, `price_variant`, `market_price`, `price_created_at` | one row's worth of the `prices[]` array |
-| `raw_json` | the full API response for that card, for debugging/recovering fields not yet mapped to a column |
-
 ## Plan: coverage and limits
 
 This repo now runs on **Pro** (20,000 credits/day). `common.py`'s `DAILY_CREDIT_LIMIT` still defaults to 500 (the Free-plan value) but self-corrects on the first request of the day from the live `x-credits-limit` response header, so no `.env` change is required — set `PKMNPRICES_DAILY_LIMIT=20000` only if you want the pre-flight check to know the real ceiling before that first call.
@@ -120,12 +106,12 @@ This repo now runs on **Pro** (20,000 credits/day). `common.py`'s `DAILY_CREDIT_
 
 **What's now available on Pro** (previously `403` on Free):
 - EUR / Cardmarket prices, and Japanese/German cards.
-- Price history (`/cards/:id/prices/history`) — not wired up here, since `master_prices.csv` + `price_history` already build this repo's own history day by day.
+- Price history (`/cards/:id/prices/history`) — not wired up here, since `price_history` already builds this repo's own history day by day.
 - `GET /cards/:id/listings/ebay` — eBay sold comps, including PSA/BGS/CGC graded sales. `fetch_prices.py` now calls this for every watchlisted card alongside the TCGplayer fetch; see the SQLite section above for how graded rows are stored.
 - Sealed products (`/sealed`, `/sealed/:id`, `/sealed/:id/listings/ebay`) — not wired up here; the watchlist/tracker is card-only for now.
 
 ## Notes
 
 - Rate limiting (60/min on Free) is handled with exponential backoff in `common.py`; at 1 request per card this is very unlikely to be hit before the credit limit is.
-- Every run writes both `data/pokemon.db` and the CSVs; the workflow commits all of `data/` back to the repo.
+- Every run writes `data/pokemon.db`; the workflow commits it back to the repo. `data/master_prices.csv` and `data/snapshots/` are gitignored now — any copies on disk are leftovers from before CSVs were dropped and are safe to delete.
 - `data/.progress-YYYY-MM-DD.json` is gitignored — it's a same-day resume aid, not meant to persist across days.

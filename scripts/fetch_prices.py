@@ -2,17 +2,21 @@
 Daily price collection job.
 
 For every card in config/watchlist.csv, calls GET /v1/cards/:id (1 credit
-each) and appends one CSV row per TCGplayer price entry returned (a card with
-5 condition/variant rows produces 5 output rows). It then also calls
+each) and stores one price_history row per TCGplayer price entry returned (a
+card with 5 condition/variant rows produces 5 rows). It then also calls
 GET /v1/cards/:id/listings/ebay (1 credit per listing returned, Pro+ only)
 and stores every eBay sold comp — including PSA/BGS/CGC graded sales — into
-pokemon.db's price_history table. eBay rows aren't written to the CSVs, only
-to the DB (see db.py's module docstring for why they need a different grain).
+the same table.
 
 Writes to:
-  data/master_prices.csv        - full TCGplayer history, append-only
-  data/snapshots/YYYY-MM-DD.csv - just today's TCGplayer rows, for easy diffing
-  data/pokemon.db               - SQLite cards + price_history tables; see db.py
+  data/pokemon.db - SQLite cards + price_history tables; see db.py
+
+(This used to also append to data/master_prices.csv and
+data/snapshots/YYYY-MM-DD.csv. Dropped — an unbounded, forever-growing,
+git-committed CSV with the full raw API response repeated on every single
+price-entry row eventually produced a 100MB+ blob in this repo's history and
+broke the daily workflow's push. The DB doesn't have this problem: it's
+upserted/deduplicated rather than pure-append.)
 
 Resume support: if the job is interrupted (credit limit hit, network error,
 workflow timeout), data/.progress-YYYY-MM-DD.json remembers which card IDs
@@ -25,7 +29,6 @@ only pays for listings added after the last one it saw.
 """
 
 import csv
-import json
 from datetime import date
 from pathlib import Path
 
@@ -33,47 +36,12 @@ import db
 from common import ApiClient, CreditBudgetExhausted, DATA_DIR, load_json, save_json
 
 WATCHLIST_PATH = Path(__file__).resolve().parent.parent / "config" / "watchlist.csv"
-MASTER_CSV = DATA_DIR / "master_prices.csv"
-SNAPSHOTS_DIR = DATA_DIR / "snapshots"
 
 EBAY_PAGE_LIMIT = 20
 # Safety cap so one card with an unexpectedly long eBay sales history can't
 # loop forever / blow the daily credit budget on its own; a card past this
 # cap just picks up the rest via `since` on a later run.
 EBAY_MAX_PAGES = 50
-
-CSV_FIELDS = [
-    "snapshot_date",
-    "id",
-    "tcg_player_id",
-    "name",
-    "number",
-    "total_set_number",
-    "rarity",
-    "artist",
-    "set_id",
-    "set_name",
-    "stage",
-    "card_type",
-    "hp",
-    "weakness",
-    "resistance",
-    "retreat_cost",
-    "energy_type",
-    "ability",
-    "flavor_text",
-    "attacks",
-    "cardmarket_url",
-    "cardmarket_product_id",
-    "price_source",
-    "price_currency",
-    "price_condition",
-    "price_variant",
-    "market_price",
-    "price_created_at",
-    "image_url",
-    "raw_json",
-]
 
 
 def load_watchlist() -> list[dict]:
@@ -92,7 +60,7 @@ def sys_exit_no_watchlist():
 
 def flatten_card(card: dict, today: str) -> list[dict]:
     """One row per price entry. A card with no prices yet still gets one
-    row (with price fields blank) so it isn't silently dropped from the CSV."""
+    row (with price fields blank) so db.upsert_cards still records it."""
     set_info = card.get("set") or {}
     base = {
         "snapshot_date": today,
@@ -100,27 +68,9 @@ def flatten_card(card: dict, today: str) -> list[dict]:
         "tcg_player_id": card.get("tcg_player_id"),
         "name": card.get("name"),
         "number": card.get("number"),
-        "total_set_number": card.get("total_set_number"),
         "rarity": card.get("rarity"),
-        "artist": card.get("artist"),
         "set_id": set_info.get("id"),
-        "set_name": set_info.get("name"),
-        "stage": card.get("stage"),
         "card_type": card.get("card_type"),
-        "hp": card.get("hp"),
-        "weakness": card.get("weakness"),
-        "resistance": card.get("resistance"),
-        "retreat_cost": card.get("retreat_cost"),
-        "energy_type": json.dumps(card.get("energy_type")) if card.get("energy_type") else None,
-        "ability": card.get("ability"),
-        "flavor_text": card.get("flavor_text"),
-        "attacks": json.dumps(card.get("attacks")) if card.get("attacks") else None,
-        "cardmarket_url": card.get("cardmarket_url"),
-        "cardmarket_product_id": card.get("cardmarket_product_id"),
-        "image_url": card.get("image_url"),
-        # Full raw response kept for debugging / recovering fields not yet
-        # mapped to a column — cheap insurance against API shape changes.
-        "raw_json": json.dumps(card, separators=(",", ":")),
     }
 
     prices = card.get("prices") or []
@@ -204,16 +154,6 @@ def flatten_ebay_listings(card_id: int, listings: list[dict]) -> list[dict]:
     return rows
 
 
-def append_rows(path: Path, rows: list[dict]):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not path.exists()
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        if write_header:
-            writer.writeheader()
-        writer.writerows(rows)
-
-
 def run(client: ApiClient, store: db.Store) -> dict:
     """The watchlist price-history task: TCGplayer + eBay listings for every
     not-yet-done card today. Stops early (without raising) if `client` runs
@@ -227,8 +167,6 @@ def run(client: ApiClient, store: db.Store) -> dict:
 
     watchlist = load_watchlist()
     print(f"Watchlist has {len(watchlist)} card(s); {len(done_ids)} already fetched today.")
-
-    snapshot_path = SNAPSHOTS_DIR / f"{today}.csv"
 
     fetched, failed, stopped_early = 0, 0, False
     for entry in watchlist:
@@ -250,8 +188,6 @@ def run(client: ApiClient, store: db.Store) -> dict:
             continue
 
         rows = flatten_card(card, today)
-        append_rows(MASTER_CSV, rows)
-        append_rows(snapshot_path, rows)
         store.save_flat_rows(rows)
 
         try:

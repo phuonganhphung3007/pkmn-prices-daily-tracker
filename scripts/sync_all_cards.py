@@ -26,7 +26,7 @@ from datetime import date
 
 import db
 from common import ApiClient, CreditBudgetExhausted, DATA_DIR, load_json, save_json
-from fetch_prices import MASTER_CSV, SNAPSHOTS_DIR, append_rows, flatten_card
+from fetch_prices import flatten_card
 
 PROGRESS_PATH = DATA_DIR / ".progress-sync-all.json"
 PER_PAGE = 100
@@ -42,20 +42,17 @@ def load_progress() -> dict:
 
 
 class Writer:
-    """Writes card + price rows to pokemon.db and the CSVs."""
+    """Writes card + price rows to pokemon.db."""
 
     def __init__(self, store: db.Store, today: str):
         self.store = store
         self.today = today
-        self.snapshot_path = SNAPSHOTS_DIR / f"{today}.csv"
         self.card_rows: list[dict] = []
 
     def add_card_only(self, flat_row: dict):
         self.card_rows.append(db.to_card_row(flat_row))
 
     def add_priced(self, flat_rows: list[dict]):
-        append_rows(MASTER_CSV, flat_rows)
-        append_rows(self.snapshot_path, flat_rows)
         self.store.save_flat_rows(flat_rows)
 
     def flush(self):
@@ -75,6 +72,12 @@ def list_phase(client, writer, progress, done_ids, max_pages):
             resp = client.get("/cards", params={"page": page, "per_page": PER_PAGE})
         except CreditBudgetExhausted as e:
             print(f"Stopping list phase at page {page} — {e}")
+            return False
+        except RuntimeError as e:
+            # Transient (rate limiting that outlasted the backoff, a 5xx
+            # streak, a network blip) — stop without advancing next_page, so
+            # the next run retries this same page instead of losing it.
+            print(f"Stopping list phase at page {page} — transient error: {e}")
             return False
 
         priced, queued = 0, 0
