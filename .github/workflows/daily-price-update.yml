@@ -1,5 +1,16 @@
 name: Daily Pokémon Price Update
 
+# GitHub only honors `schedule:` triggers defined in the repo's default
+# branch (main), regardless of which branch has the "real"/current workflow
+# file — so this copy has to be the one that exists for the cron to fire at
+# all. All actual work now happens on db-storage: this checks db-storage out,
+# runs its scripts against its data/pokemon.db, and commits back to
+# db-storage only. main's own tree is intentionally left untouched (paused) —
+# this file no longer fetches prices for or commits anything to main itself.
+#
+# db-storage has its own identical copy of this file for when someone
+# manually runs the workflow from that branch directly.
+
 on:
   schedule:
     # 13:17 UTC daily — arbitrary off-peak minute to avoid the top-of-hour
@@ -8,14 +19,16 @@ on:
   workflow_dispatch: {}  # allows manual "Run workflow" from the Actions tab
 
 permissions:
-  contents: write  # needed to commit the updated CSVs back to the repo
+  contents: write  # needed to commit the updated database back to db-storage
 
 jobs:
   fetch-prices:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repo
+      - name: Check out db-storage branch
         uses: actions/checkout@v4
+        with:
+          ref: db-storage
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -25,10 +38,10 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Fetch today's prices
+      - name: Sync catalog + fetch today's prices into data/pokemon.db
         env:
           PKMNPRICES_API_KEY: ${{ secrets.PKMNPRICES_API_KEY }}
-        run: python scripts/fetch_prices.py
+        run: python scripts/daily_sync.py
 
       - name: Commit updated data
         run: |
@@ -36,4 +49,4 @@ jobs:
           git config user.email "actions@users.noreply.github.com"
           git add data/
           git diff --cached --quiet || git commit -m "Daily price update: $(date -u +'%Y-%m-%d')"
-          git push
+          git push origin HEAD:db-storage
