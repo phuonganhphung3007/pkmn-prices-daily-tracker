@@ -1,5 +1,11 @@
 name: Daily Pokémon Price Update
 
+# GitHub only honors `schedule:` triggers defined in the repo's default
+# branch (main), so main has its own copy of this file that checks out and
+# pushes back to db-storage explicitly — main's own tree is intentionally
+# left alone by that copy. This copy is for running it manually from the
+# db-storage branch directly (Actions tab -> branch selector -> db-storage).
+
 on:
   schedule:
     # 13:17 UTC daily — arbitrary off-peak minute to avoid the top-of-hour
@@ -8,14 +14,16 @@ on:
   workflow_dispatch: {}  # allows manual "Run workflow" from the Actions tab
 
 permissions:
-  contents: write  # needed to commit the updated database + CSVs back to the repo
+  contents: write  # needed to commit the updated database back to db-storage
 
 jobs:
   fetch-prices:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repo
+      - name: Check out db-storage branch
         uses: actions/checkout@v4
+        with:
+          ref: db-storage
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -36,4 +44,4 @@ jobs:
           git config user.email "actions@users.noreply.github.com"
           git add data/
           git diff --cached --quiet || git commit -m "Daily price update: $(date -u +'%Y-%m-%d')"
-          git push
+          git push origin HEAD:db-storage
