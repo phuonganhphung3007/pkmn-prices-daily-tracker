@@ -1,38 +1,49 @@
 # pkmnprices-tracker
 
-Daily Pokémon card price tracker built on the [pkmnprices.com](https://pkmnprices.com) API (Pro plan). Collects TCGplayer (USD) prices and eBay sold comps (including PSA/BGS/CGC graded sales) for a watchlist of cards once a day via GitHub Actions and saves them to a SQLite database.
+Daily Pokémon card price tracker built on the [pkmnprices.com](https://pkmnprices.com) API (Pro plan). Grows a full catalogue of cards and collects TCGplayer (USD) prices and eBay sold comps (including PSA/BGS/CGC graded sales) for every one of them, once a day via GitHub Actions, saving it all to a SQLite database.
 
 ## How it works
 
 ```
-config/watchlist.csv        <- cards you're tracking (id, tcg_player_id, name, set_name)
-scripts/build_watchlist.py  <- one-time/occasional: discover card IDs, add to watchlist
 scripts/daily_sync.py       <- daily entry point: splits today's credits across the two tasks below
-scripts/fetch_prices.py     <- task: GET /v1/cards/:id + /listings/ebay for each watchlisted card
-scripts/sync_all_cards.py   <- task: fill pokemon.db with every card in the API (multi-day)
+scripts/sync_all_cards.py   <- task: discover every card in the API into `cards` (multi-day), then price it
+scripts/fetch_prices.py     <- task: GET /v1/cards/:id + /listings/ebay for every card already in `cards`
 data/pokemon.db             <- SQLite: cards + price_history tables
 scripts/db.py               <- SQLite table setup + save helpers
-scripts/backfill_db.py      <- one-off: load an old master_prices.csv export into pokemon.db
+scripts/backfill_db.py      <- one-off: import an externally-supplied CSV export into pokemon.db
 .github/workflows/daily-price-update.yml <- cron job: daily_sync.py -> pokemon.db, committed back
 ```
 
-**No CSVs are written anymore** — `pokemon.db` is the only output. This repo used to also append every row to `data/master_prices.csv` and `data/snapshots/YYYY-MM-DD.csv`, but that CSV is pure append-only (it never shrinks) and had the full raw API response duplicated on *every single price-entry row*; historical versions of it in this repo's git history grew past 100MB, which GitHub rejects on push. The DB doesn't have this problem — rows are upserted/deduplicated rather than appended forever.
+**No CSVs are written or read by the daily pipeline** — `pokemon.db` is the only input and output. There used to be a hand-picked `config/watchlist.csv` that `fetch_prices.py` priced instead of the full catalogue, plus `data/master_prices.csv` / `data/snapshots/YYYY-MM-DD.csv` that every run appended to. All three are gone: the watchlist was a small subset of what `sync_all_cards.py` discovers anyway, so `fetch_prices.py` now prices every card already in `cards` directly; and the append-only CSVs (with the full raw API response duplicated on *every single price-entry row*) grew a historical blob past 100MB in this repo's git history, which GitHub rejects on push. The DB has neither problem — rows are upserted/deduplicated, not appended forever, and it's the only thing committed now. (`backfill_db.py` still reads a CSV, but only as a one-off import path for an externally-supplied file — nothing in this repo produces one for it to read anymore.)
 
-Discovery (searching for cards) and daily collection (pricing cards you've already chosen) are **deliberately separate scripts**, because both `GET /v1/cards` (search) and `GET /v1/cards/:id` (detail) bill 1 credit per item returned. If discovery and collection were combined, you'd re-pay the search cost every single day. Splitting them means:
+### `scripts/sync_all_cards.py` — catalogue growth, then price refresh
 
-- You pay the search/discovery cost once per card, ever.
-- The watchlist task's cost is `(1 + eBay listings returned) × watchlist size` — predictable day to day once each card's eBay history has been backfilled once.
+Three phases, the first two gated behind the previous one finishing (data/.progress-sync-all.json tracks where each run left off):
+
+1. **List** — pages `GET /v1/cards` (1 credit/item) and upserts every card into `cards`. A list item with inline prices is stored immediately; one without is queued for phase 2.
+2. **Detail** — once every list page has been walked, fetches `GET /v1/cards/:id` (1 credit/card) one by one for everything phase 1 queued.
+3. **Price refresh** — once phases 1-2 are *both* fully caught up (the whole catalogue discovered and priced at least once), there's no more discovery work left, but a run often still has budget to spend. Rather than go idle, it hands off to `fetch_prices.py`'s own logic for the rest of its budget, so nothing is wasted once the catalogue stops growing.
+
+```
+python scripts/sync_all_cards.py --max-pages 1   # try one page
+python scripts/sync_all_cards.py                 # continue where it left off
+python scripts/sync_all_cards.py --list-only      # phase 1 only — skip phase 2 and phase 3
+```
+
+### `scripts/fetch_prices.py` — price refresh for the whole catalogue
+
+For every card_id already in `cards` (not a watchlist — the full table, whatever `sync_all_cards.py` has discovered so far), calls `GET /v1/cards/:id` (1 credit) for TCGplayer prices and `GET /v1/cards/:id/listings/ebay` (1 credit/listing) for eBay sold comps, skipping anything already done today. This is also exactly what `sync_all_cards.py`'s phase 3 calls into — the two never double-spend credits on the same card in one run, since whichever runs first marks it done for today and the other skips it.
 
 ### `scripts/daily_sync.py` — the daily entry point
 
-Two tasks compete for the same daily credit pool, with different urgency: catalog growth (`sync_all_cards.py`) can spill over for days without hurting anything, but price history (`fetch_prices.py`) needs to run *every* day to be worth having. Just running catalog growth until it runs out of credits — the naive approach — can burn the entire day's budget on catalog growth alone and leave nothing for that day's price refresh.
+Two priorities compete for the same daily credit pool: catalog growth can spill over for days without hurting anything, but price refresh needs to run *every* day to be worth having. Just running `sync_all_cards.py` until it's out of credits — the naive approach — can burn the entire day's budget on discovery alone (or, once discovery's done, that's no longer even possible — see phase 3 above — but a fixed split still keeps each priority's share predictable).
 
-`daily_sync.py` fixes that by querying today's real remaining credit pool once, then splitting it:
+`daily_sync.py` queries today's real remaining credit pool once, then splits it:
 
-1. **Catalog growth** (priority 1) gets first claim on a share of the pool — `--catalog-share`, default 50% (`PKMNPRICES_CATALOG_SHARE` env var) — and is hard-capped there even if it would otherwise keep going.
-2. **Price history** (priority 2) gets the rest of the pool, plus whatever catalog growth didn't spend (e.g. because it finished a page run early, or is already fully caught up).
+1. **Catalog growth** (priority 1, `sync_all_cards.run()`) gets first claim on a share of the pool — `--catalog-share`, default 50% (`PKMNPRICES_CATALOG_SHARE` env var) — and is hard-capped there even if it would otherwise keep going.
+2. **Price history** (priority 2, `fetch_prices.run()`) gets the rest of the pool, plus whatever catalog growth didn't spend (e.g. because it finished a page run early, or had nothing left to discover and its own phase-3 price refresh already used part of its share).
 
-Both tasks remain independently resumable (their own progress files / DB state), so this is just how *today's* budget gets divided between them — run it daily (the GitHub Actions workflow already does) and each day picks up exactly where the previous one left off for both tasks.
+Both tasks remain independently resumable (their own progress files / DB state), so this is just how *today's* budget gets divided between them — run it daily (the GitHub Actions workflow already does) and each day picks up exactly where the previous one left off.
 
 ```
 python scripts/daily_sync.py                      # the daily cron entry point
@@ -46,14 +57,8 @@ python scripts/daily_sync.py --max-pages 20         # also cap catalog list page
 
 1. `pip install -r requirements.txt`
 2. Copy `.env.example` to `.env` and add your key from the [pkmnprices dashboard](https://pkmnprices.com/dashboard).
-3. Build your watchlist, e.g.:
-   ```
-   python scripts/build_watchlist.py --set-id 123
-   python scripts/build_watchlist.py --name "Charizard"
-   python scripts/build_watchlist.py --tcg-player-id 519184
-   ```
-4. Run a manual fetch to test: `python scripts/daily_sync.py` (or `python scripts/fetch_prices.py` for just the watchlist task, skipping catalog growth)
-5. For GitHub Actions: add `PKMNPRICES_API_KEY` as a repo secret (Settings → Secrets and variables → Actions), push this repo, and the workflow runs daily on its own (or trigger it manually from the Actions tab via "Run workflow").
+3. Run a manual sync to test: `python scripts/daily_sync.py` (nothing to configure first — there's no watchlist to build; `cards` starts empty and grows from here)
+4. For GitHub Actions: add `PKMNPRICES_API_KEY` as a repo secret (Settings → Secrets and variables → Actions), push this repo, and the workflow runs daily on its own (or trigger it manually from the Actions tab via "Run workflow").
 
 ## SQLite database (`data/pokemon.db`)
 
@@ -81,12 +86,6 @@ python scripts/backfill_db.py --file path/to/master_prices.csv
 python scripts/backfill_db.py --file path/to/a-snapshot.csv   # just one day
 ```
 
-**Sync every card** the API knows about with `scripts/sync_all_cards.py`. It pages through `GET /v1/cards` and upserts every card into `cards`. Prices included in a list item go straight into `price_history`. Cards without prices are queued, and each one is fetched with `GET /v1/cards/:id`. The catalogue has ~93,000 cards and list items never include prices even on Pro, so a full sync costs ~2 credits per card and takes many days. Progress is saved in `data/.progress-sync-all.json`, so just re-run it until it prints "All cards synced."
-```
-python scripts/sync_all_cards.py --max-pages 1   # try one page
-python scripts/sync_all_cards.py                 # continue where it left off
-```
-
 Example: latest price per card and variant
 
 ```sql
@@ -100,15 +99,15 @@ WHERE p.price_date = (SELECT MAX(price_date) FROM price_history);
 
 This repo now runs on **Pro** (20,000 credits/day). `common.py`'s `DAILY_CREDIT_LIMIT` still defaults to 500 (the Free-plan value) but self-corrects on the first request of the day from the live `x-credits-limit` response header, so no `.env` change is required — set `PKMNPRICES_DAILY_LIMIT=20000` only if you want the pre-flight check to know the real ceiling before that first call.
 
-**Daily coverage:** `GET /v1/cards/:id` costs 1 credit/card; `GET /v1/cards/:id/listings/ebay` costs 1 credit per listing returned (up to 20/page). A watchlist of a few hundred cards, each with a handful of new eBay comps a day, comfortably fits in the 20,000/day budget — the daily job stops early and resumes on the next run if it ever doesn't.
+**Daily coverage:** `GET /v1/cards/:id` costs 1 credit/card; `GET /v1/cards/:id/listings/ebay` costs 1 credit per listing returned (up to 20/page). The catalogue (~93,000 cards) is far bigger than the 20,000/day budget, so `daily_sync.py` makes steady, resumable progress rather than finishing in one run — see `scripts/sync_all_cards.py` above.
 
-**Discovery cost is separate and comes out of the same pool.** Building a watchlist via `GET /v1/cards` also bills 1 credit per item returned, at up to 100 per page.
+**Discovery cost is separate and comes out of the same pool.** `GET /v1/cards` (catalogue discovery) also bills 1 credit per item returned, at up to 100 per page.
 
 **What's now available on Pro** (previously `403` on Free):
 - EUR / Cardmarket prices, and Japanese/German cards.
 - Price history (`/cards/:id/prices/history`) — not wired up here, since `price_history` already builds this repo's own history day by day.
-- `GET /cards/:id/listings/ebay` — eBay sold comps, including PSA/BGS/CGC graded sales. `fetch_prices.py` now calls this for every watchlisted card alongside the TCGplayer fetch; see the SQLite section above for how graded rows are stored.
-- Sealed products (`/sealed`, `/sealed/:id`, `/sealed/:id/listings/ebay`) — not wired up here; the watchlist/tracker is card-only for now.
+- `GET /cards/:id/listings/ebay` — eBay sold comps, including PSA/BGS/CGC graded sales. `fetch_prices.py` calls this for every card in `cards` alongside the TCGplayer fetch; see the SQLite section above for how graded rows are stored.
+- Sealed products (`/sealed`, `/sealed/:id`, `/sealed/:id/listings/ebay`) — not wired up here; this tracker is card-only for now.
 
 ## Notes
 

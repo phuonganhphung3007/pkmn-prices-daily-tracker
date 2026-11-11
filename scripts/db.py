@@ -209,6 +209,12 @@ class Store:
         )
         return {r[0] for r in cur}
 
+    def all_card_ids(self) -> list[int]:
+        """Every card_id already known in `cards`, ascending — the catalogue
+        that fetch_prices.py refreshes prices for daily (no more watchlist)."""
+        cur = self.conn.execute("SELECT card_id FROM cards ORDER BY card_id")
+        return [r[0] for r in cur]
+
     def last_ebay_ingested_at(self, card_id: int) -> str | None:
         """The most recent eBay ingested_at already stored for this card, so
         the next fetch asks the API for just the listings added since then

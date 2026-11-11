@@ -3,23 +3,29 @@ Daily automation: one shared credit pool, split across two priorities.
 
   1. Catalog growth  (sync_all_cards.py) - discover every card in the API and
      queue the ones without inline prices for a detail/price lookup. This can
-     take many days to finish the full ~93,000-card catalog.
+     take many days to finish the full ~93,000-card catalog. Once fully
+     caught up, it has no more discovery work, so it falls through to the
+     same price refresh priority 2 does with whatever budget it has left.
   2. Price history    (fetch_prices.py)   - refresh today's prices (TCGplayer
-     market price + eBay sold listings, including graded sales) for the
-     watchlist. Needs to run every day to be useful.
+     market price + eBay sold listings, including graded sales) for every
+     card already in `cards`. Needs to run every day to be useful.
 
 Both tasks are already resumable on their own (sync_all_cards.py's progress
 file, fetch_prices.py's per-day progress file + what's already in
 price_history) — what they don't have on their own is a way to share one
 day's credit budget fairly. Running sync_all_cards.py until it's out of
 credits (the naive approach) can burn the *entire* daily pool on catalog
-growth alone and leave nothing for the watchlist's price refresh that day.
+growth alone and leave nothing for that day's price refresh.
 
 This script fixes that by giving catalog growth first claim on a share of
 today's remaining credits (default 50%, since it's priority 1), then handing
 whatever it didn't spend — plus price history's own share — to price
 history. Catalog growth still can't starve price history out entirely: its
-spending is capped at its share even if it would otherwise keep going.
+spending is capped at its share even if it would otherwise keep going. (The
+two tasks won't double-spend credits on the same card even when catalog
+growth's own leftover-budget price refresh and this script's explicit price
+history step both run in one invocation — fetch_prices.run() skips whatever
+is already marked done for today.)
 
 Usage:
   python scripts/daily_sync.py                      # the daily cron entry point
@@ -80,6 +86,13 @@ def main():
             f"Catalog growth spent {catalog_spent}/{catalog_budget} credits "
             f"({'fully caught up' if catalog_stats['finished'] else 'not finished — resumes next run'}).\n"
         )
+        if catalog_stats.get("price_stats"):
+            cp = catalog_stats["price_stats"]
+            print(
+                f"  (catalogue was already fully discovered, so that budget also went toward a "
+                f"price refresh: fetched {cp['fetched']}, {cp['failed']} failed/skipped, "
+                f"{cp['remaining']} remaining)\n"
+            )
 
         print("--- 2. Price history ---")
         client.set_allocation(price_budget + leftover)

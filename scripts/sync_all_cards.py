@@ -1,23 +1,32 @@
 """
-Fill the database with every card the API knows about.
+Fill the database with every card the API knows about, then keep it priced.
 
 Phase 1 (get all): page through GET /v1/cards and upsert every card into the
   `cards` table. If a list item already carries a `prices` array, its rows go
   straight into `price_history` for today. If it has no prices, the card id
   is queued for phase 2.
 Phase 2 (one by one): for each queued card, GET /v1/cards/:id and load its
-  prices, same as fetch_prices.py does for the watchlist.
+  prices, same as fetch_prices.py does.
+Phase 3 (once the catalogue's fully discovered): once phase 1 has paged every
+  list page and phase 2's queue is empty — i.e. every card the API knows
+  about is in `cards` — there's no more discovery work left for this script
+  to do, but there's often still credit budget for the run. Rather than stop,
+  it hands off to fetch_prices.run(), which refreshes prices for every card
+  in `cards` (itself resumable/skip-if-already-done-today), so a run that
+  finishes catalogue discovery early still spends the rest of its budget
+  usefully instead of going idle.
 
-Both endpoints bill 1 credit per item returned, and the full catalogue is far
-bigger than the Free plan's 500 credits/day, so this is built to run over many
-days: data/.progress-sync-all.json remembers the next list page and the
-detail queue, and cards already priced today in data/pokemon.db are skipped. Just
-re-run it (e.g. once a day) until it reports it's finished.
+Both list/detail endpoints bill 1 credit per item returned, and the full
+catalogue is far bigger than one day's credit budget, so phases 1-2 are built
+to run over many days: data/.progress-sync-all.json remembers the next list
+page and the detail queue, and cards already priced today in data/pokemon.db
+are skipped. Just re-run it (e.g. once a day) until phase 1-2 reports it's
+finished — after that, every run is phase 3 only.
 
 Usage:
   python scripts/sync_all_cards.py                  # continue where it left off
   python scripts/sync_all_cards.py --max-pages 5    # cap list pages this run
-  python scripts/sync_all_cards.py --list-only      # phase 1 only, no detail calls
+  python scripts/sync_all_cards.py --list-only      # phase 1 only, no detail/price calls
   python scripts/sync_all_cards.py --restart        # forget progress, start at page 1
 """
 
@@ -25,8 +34,8 @@ import argparse
 from datetime import date
 
 import db
+import fetch_prices
 from common import ApiClient, CreditBudgetExhausted, DATA_DIR, load_json, save_json
-from fetch_prices import flatten_card
 
 PROGRESS_PATH = DATA_DIR / ".progress-sync-all.json"
 PER_PAGE = 100
@@ -86,13 +95,13 @@ def list_phase(client, writer, progress, done_ids, max_pages):
             card_id = int(item["id"])
             if item.get("prices"):
                 if card_id not in done_ids:
-                    writer.add_priced(flatten_card(item, writer.today))
+                    writer.add_priced(fetch_prices.flatten_card(item, writer.today))
                     done_ids.add(card_id)
                     priced += 1
                 else:
-                    writer.add_card_only(flatten_card({**item, "prices": None}, writer.today)[0])
+                    writer.add_card_only(fetch_prices.flatten_card({**item, "prices": None}, writer.today)[0])
             else:
-                writer.add_card_only(flatten_card(item, writer.today)[0])
+                writer.add_card_only(fetch_prices.flatten_card(item, writer.today)[0])
                 if card_id not in done_ids and card_id not in queue:
                     queue.add(card_id)
                     progress["detail_queue"].append(card_id)
@@ -126,7 +135,7 @@ def detail_phase(client, writer, progress, done_ids):
                     print(f"Skipping card {card_id}: {e}")
                     failed += 1
                 else:
-                    writer.add_priced(flatten_card(card, writer.today))
+                    writer.add_priced(fetch_prices.flatten_card(card, writer.today))
                     done_ids.add(card_id)
                     fetched += 1
             progress["detail_queue"].pop(0)
@@ -148,11 +157,13 @@ def run(
 ) -> dict:
     """The catalog-growth task: page the full card list into `cards`, then
     (unless list_only) fetch + store prices one by one for cards the list
-    didn't already include prices for. Stops early (without raising) if
-    `client` runs out of credits — either the real daily limit, or a soft
-    per-task allocation set via client.set_allocation() by an orchestrator
-    sharing today's budget across multiple tasks. Caller owns the Store's
-    lifecycle."""
+    didn't already include prices for. Once that's fully caught up (unless
+    list_only), hands any leftover budget to fetch_prices.run() for a price
+    refresh pass over the whole `cards` table — see the module docstring's
+    phase 3. Stops early (without raising) if `client` runs out of credits —
+    either the real daily limit, or a soft per-task allocation set via
+    client.set_allocation() by an orchestrator sharing today's budget across
+    multiple tasks. Caller owns the Store's lifecycle."""
     if restart and PROGRESS_PATH.exists():
         PROGRESS_PATH.unlink()
     progress = load_progress()
@@ -175,26 +186,41 @@ def run(
         print("All cards synced.")
         PROGRESS_PATH.unlink(missing_ok=True)
 
+    price_stats = None
+    if finished and not list_only:
+        print("Catalogue fully discovered — continuing with a price refresh over all cards.")
+        price_stats = fetch_prices.run(client, store)
+
     return {
         "list_done": progress["list_done"],
         "detail_queue_len": len(progress["detail_queue"]),
         "finished": finished,
+        "price_stats": price_stats,
     }
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--max-pages", type=int, default=None, help="cap list pages fetched this run")
-    ap.add_argument("--list-only", action="store_true", help="skip the one-by-one detail phase")
+    ap.add_argument(
+        "--list-only", action="store_true", help="skip the detail phase and the price refresh pass"
+    )
     ap.add_argument("--restart", action="store_true", help="discard saved progress first")
     args = ap.parse_args()
 
     store = db.Store()
     client = ApiClient()
     try:
-        run(client, store, max_pages=args.max_pages, list_only=args.list_only, restart=args.restart)
+        stats = run(client, store, max_pages=args.max_pages, list_only=args.list_only, restart=args.restart)
     finally:
         store.close()
+
+    if stats["price_stats"]:
+        p = stats["price_stats"]
+        print(
+            f"Price refresh: fetched {p['fetched']} card(s), {p['failed']} failed/skipped, "
+            f"{p['remaining']} remaining."
+        )
 
     print(f"Credits used today: {client.credits_charged_today}/{client.credits_limit}.")
 

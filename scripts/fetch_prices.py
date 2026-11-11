@@ -1,9 +1,10 @@
 """
 Daily price collection job.
 
-For every card in config/watchlist.csv, calls GET /v1/cards/:id (1 credit
-each) and stores one price_history row per TCGplayer price entry returned (a
-card with 5 condition/variant rows produces 5 rows). It then also calls
+For every card already in pokemon.db's `cards` table (the full catalogue, not
+a hand-picked watchlist), calls GET /v1/cards/:id (1 credit each) and stores
+one price_history row per TCGplayer price entry returned (a card with 5
+condition/variant rows produces 5 rows). It then also calls
 GET /v1/cards/:id/listings/ebay (1 credit per listing returned, Pro+ only)
 and stores every eBay sold comp — including PSA/BGS/CGC graded sales — into
 the same table.
@@ -11,12 +12,16 @@ the same table.
 Writes to:
   data/pokemon.db - SQLite cards + price_history tables; see db.py
 
-(This used to also append to data/master_prices.csv and
-data/snapshots/YYYY-MM-DD.csv. Dropped — an unbounded, forever-growing,
-git-committed CSV with the full raw API response repeated on every single
-price-entry row eventually produced a 100MB+ blob in this repo's history and
-broke the daily workflow's push. The DB doesn't have this problem: it's
-upserted/deduplicated rather than pure-append.)
+(This used to read config/watchlist.csv and also append to
+data/master_prices.csv / data/snapshots/YYYY-MM-DD.csv. Both dropped: the
+watchlist was a small hand-picked subset of cards, but the `cards` table —
+filled by sync_all_cards.py — is now the actual source of what's trackable,
+so refreshing prices for it directly covers everything the watchlist did and
+far more, with one fewer file to keep in sync. The CSVs were pure-append and
+git-committed; an unbounded one eventually produced a 100MB+ blob in this
+repo's history and broke the daily workflow's push. The DB doesn't have
+either problem: it's upserted/deduplicated, not appended, and it's the only
+thing committed now.)
 
 Resume support: if the job is interrupted (credit limit hit, network error,
 workflow timeout), data/.progress-YYYY-MM-DD.json remembers which card IDs
@@ -28,34 +33,16 @@ card's `since` is the newest ingested_at already stored for it, so a later run
 only pays for listings added after the last one it saw.
 """
 
-import csv
 from datetime import date
-from pathlib import Path
 
 import db
 from common import ApiClient, CreditBudgetExhausted, DATA_DIR, load_json, save_json
-
-WATCHLIST_PATH = Path(__file__).resolve().parent.parent / "config" / "watchlist.csv"
 
 EBAY_PAGE_LIMIT = 20
 # Safety cap so one card with an unexpectedly long eBay sales history can't
 # loop forever / blow the daily credit budget on its own; a card past this
 # cap just picks up the rest via `since` on a later run.
 EBAY_MAX_PAGES = 50
-
-
-def load_watchlist() -> list[dict]:
-    if not WATCHLIST_PATH.exists():
-        sys_exit_no_watchlist()
-    with open(WATCHLIST_PATH, "r", newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
-
-
-def sys_exit_no_watchlist():
-    raise SystemExit(
-        f"No watchlist found at {WATCHLIST_PATH}. "
-        "Run scripts/build_watchlist.py first to populate it."
-    )
 
 
 def flatten_card(card: dict, today: str) -> list[dict]:
@@ -155,22 +142,22 @@ def flatten_ebay_listings(card_id: int, listings: list[dict]) -> list[dict]:
 
 
 def run(client: ApiClient, store: db.Store) -> dict:
-    """The watchlist price-history task: TCGplayer + eBay listings for every
-    not-yet-done card today. Stops early (without raising) if `client` runs
-    out of credits — either the real daily limit, or a soft per-task
-    allocation set via client.set_allocation() by an orchestrator sharing
-    today's budget across multiple tasks. Caller owns the Store's lifecycle."""
+    """The price-history task: TCGplayer + eBay listings for every card in
+    `cards` not already done today. Stops early (without raising) if
+    `client` runs out of credits — either the real daily limit, or a soft
+    per-task allocation set via client.set_allocation() by an orchestrator
+    sharing today's budget across multiple tasks. Caller owns the Store's
+    lifecycle."""
     today = date.today().isoformat()
     progress_path = DATA_DIR / f".progress-{today}.json"
     done_ids = set(load_json(progress_path, []))
     done_ids |= store.done_card_ids(today)
 
-    watchlist = load_watchlist()
-    print(f"Watchlist has {len(watchlist)} card(s); {len(done_ids)} already fetched today.")
+    card_ids = store.all_card_ids()
+    print(f"Catalogue has {len(card_ids)} card(s); {len(done_ids)} already fetched today.")
 
     fetched, failed, stopped_early = 0, 0, False
-    for entry in watchlist:
-        card_id = int(entry["id"])
+    for card_id in card_ids:
         if card_id in done_ids:
             continue
 
@@ -219,7 +206,7 @@ def run(client: ApiClient, store: db.Store) -> dict:
     return {
         "fetched": fetched,
         "failed": failed,
-        "remaining": max(0, len(watchlist) - len(done_ids)),
+        "remaining": max(0, len(card_ids) - len(done_ids)),
         "stopped_early": stopped_early,
     }
 
