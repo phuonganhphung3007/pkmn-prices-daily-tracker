@@ -119,7 +119,15 @@ class ApiClient:
         url = f"{BASE_URL}{path}"
         backoff = 2
         for attempt in range(1, max_retries + 1):
-            resp = self.session.get(url, params=params, timeout=30)
+            try:
+                resp = self.session.get(url, params=params, timeout=30)
+            except requests.exceptions.RequestException:
+                # Connection-level failure (reset, timeout, DNS, etc.) before
+                # any response came back — nothing to inspect, so retry with
+                # the same backoff as an unexpected status below.
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+                continue
             self._update_budget_from_headers(resp.headers)
 
             if resp.status_code == 200:

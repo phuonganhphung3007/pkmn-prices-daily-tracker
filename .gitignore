@@ -3,6 +3,12 @@ __pycache__/
 *.pyc
 .venv/
 data/.progress-*.json
+# ...except the multi-day catalog-sync tracker: unlike the per-day files,
+# its whole point is to persist across days/runs. Being gitignored meant
+# every GitHub Actions run (a fresh checkout each time) started over at
+# page 1 instead of resuming, silently re-spending credits on cards already
+# discovered every single day.
+!data/.progress-sync-all.json
 
 # Dropped in favor of pokemon.db only: an unbounded, forever-growing,
 # git-committed CSV (raw_json repeated on every price-entry row) produced a
