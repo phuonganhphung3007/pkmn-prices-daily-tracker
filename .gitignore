@@ -15,3 +15,7 @@ data/.progress-*.json
 # 100MB+ blob in this repo's history and broke the daily workflow's push.
 data/master_prices.csv
 data/snapshots/*.csv
+
+# Local-only AI-agent instructions, not shared via the repo.
+CLAUDE.md
+AGENTS.md
