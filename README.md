@@ -32,7 +32,14 @@ python scripts/sync_all_cards.py --list-only      # phase 1 only — skip phase 
 
 ### `scripts/fetch_prices.py` — price refresh for the whole catalogue
 
-For every card_id already in `cards` (not a watchlist — the full table, whatever `sync_all_cards.py` has discovered so far), calls `GET /v1/cards/:id` (1 credit) for TCGplayer prices and `GET /v1/cards/:id/listings/ebay` (1 credit/listing) for eBay sold comps, skipping anything already done today. This is also exactly what `sync_all_cards.py`'s phase 3 calls into — the two never double-spend credits on the same card in one run, since whichever runs first marks it done for today and the other skips it.
+For card_ids already in `cards` (not a watchlist — the full table, whatever `sync_all_cards.py` has discovered so far), calls `GET /v1/cards/:id` (1 credit) for TCGplayer prices and `GET /v1/cards/:id/listings/ebay` (1 credit/listing) for eBay sold comps. This is also exactly what `sync_all_cards.py`'s phase 3 calls into.
+
+Where it continues from is a single persistent cursor (`db.Store.get/set_price_cursor`, stored in `pokemon.db` itself — not a gitignored file, so it survives a fresh GitHub Actions checkout): each run starts right after the last card_id it attempted, not from the first card_id in `cards` every time. Two reasons that matters:
+
+- **Backfilling the catalogue once** — one day's credit budget only covers a fraction of ~93,000 cards. Without a persistent cursor, every run would restart at the front and the back of the catalogue would never get reached at all. With it, each day picks up exactly where the last one stopped — e.g. if the last card attempted yesterday was `12573`, today starts at `12574`.
+- **Rolling refresh once that lap finishes** — when the cursor reaches the last card_id in `cards`, the next one wraps back around to the first. So once every card has been priced at least once, this keeps cycling through automatically, continuously refreshing prices across the whole catalogue instead of just stopping.
+
+A card is "attempted" (and the cursor moves past it) whether its fetch succeeded or permanently failed (e.g. a 404) — a dead card_id doesn't get retried forever, it's just visited again next lap like everything else. The cursor advances every call, so running `sync_all_cards.py`'s phase 3 and then `fetch_prices.py` again in the same `daily_sync.py` invocation never re-fetches the same card twice — the second call just continues from wherever the first left the cursor.
 
 ### `scripts/daily_sync.py` — the daily entry point
 
@@ -73,7 +80,7 @@ All data is saved in one SQLite file, `data/pokemon.db` (override with `PKMNPRIC
 
 An existing `pokemon.db` created before these grading columns existed is migrated in place the first time `db.Store()` runs against it (`ALTER TABLE ... ADD COLUMN`, then the unique index is rebuilt) — no manual steps needed.
 
-If a run stops early (credit limit, error), the next run asks `price_history` which cards it already has for today and continues from there. eBay fetching resumes separately and incrementally: each card's `since` cursor is the newest `ingested_at` already stored for it, so a later run only pays credits for listings added after the last one it saw.
+A third table, `sync_state`, is a tiny key/value store for cross-day cursors — currently just `price_cursor` (see `fetch_prices.py` above). If a run stops early (credit limit, error), the next run — today or any later day — just continues from that cursor. eBay fetching resumes separately and incrementally within that: each card's `since` is the newest `ingested_at` already stored for it, so a later pass over the same card only pays credits for listings added since the last time it was visited.
 
 **How many grades does a card have?** It varies, and that's by design — the schema never assumes one grade per card:
 - A `tcgplayer` row is always ungraded (raw market price), one row per condition/variant/day.
@@ -113,4 +120,4 @@ This repo now runs on **Pro** (20,000 credits/day). `common.py`'s `DAILY_CREDIT_
 
 - Rate limiting (60/min on Free) is handled with exponential backoff in `common.py`; at 1 request per card this is very unlikely to be hit before the credit limit is.
 - Every run writes `data/pokemon.db`; the workflow commits it back to the repo. `data/master_prices.csv` and `data/snapshots/` are gitignored now — any copies on disk are leftovers from before CSVs were dropped and are safe to delete.
-- `data/.progress-YYYY-MM-DD.json` is gitignored — it's a same-day resume aid, not meant to persist across days.
+- `data/.progress-sync-all.json` is tracked in git (not gitignored) — unlike a same-day-only progress file, it has to survive across days/runs for `sync_all_cards.py`'s multi-day discovery to actually resume instead of restarting at page 1 on every fresh GitHub Actions checkout. `fetch_prices.py` no longer uses a progress file at all — its cross-day cursor lives in `pokemon.db`'s `sync_state` table, which is already committed as part of the database.

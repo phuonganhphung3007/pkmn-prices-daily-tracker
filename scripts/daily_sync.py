@@ -91,7 +91,7 @@ def main():
             print(
                 f"  (catalogue was already fully discovered, so that budget also went toward a "
                 f"price refresh: fetched {cp['fetched']}, {cp['failed']} failed/skipped, "
-                f"{cp['remaining']} remaining)\n"
+                f"{cp['remaining']} left in this lap)\n"
             )
 
         print("--- 2. Price history ---")
@@ -99,7 +99,7 @@ def main():
         price_stats = fetch_prices.run(client, store)
         print(
             f"Price history: fetched {price_stats['fetched']} card(s), "
-            f"{price_stats['failed']} failed/skipped, {price_stats['remaining']} remaining.\n"
+            f"{price_stats['failed']} failed/skipped, {price_stats['remaining']} left in this lap.\n"
         )
     finally:
         store.close()

@@ -116,6 +116,15 @@ CREATE TABLE IF NOT EXISTS price_history (
 -- card with no prices still gets one all-NULL row per day.
 {PRICE_HISTORY_GRAIN_SQL}
 CREATE INDEX IF NOT EXISTS price_history_date ON price_history (price_date);
+
+-- A tiny durable key/value store for cross-day cursors, committed to git
+-- along with the rest of pokemon.db — unlike a gitignored progress file,
+-- this actually survives a fresh GitHub Actions checkout. Currently holds
+-- just 'price_cursor' (see fetch_prices.run()).
+CREATE TABLE IF NOT EXISTS sync_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
 """
 
 
@@ -214,6 +223,23 @@ class Store:
         that fetch_prices.py refreshes prices for daily (no more watchlist)."""
         cur = self.conn.execute("SELECT card_id FROM cards ORDER BY card_id")
         return [r[0] for r in cur]
+
+    def get_price_cursor(self) -> int | None:
+        """The last card_id fetch_prices.py attempted, across all days —
+        None if it has never run. Lets a new day continue right after where
+        the previous one stopped instead of restarting from the first card
+        in `cards` (which would otherwise never get past the first chunk of
+        the catalogue, day after day)."""
+        row = self.conn.execute("SELECT value FROM sync_state WHERE key = 'price_cursor'").fetchone()
+        return int(row[0]) if row else None
+
+    def set_price_cursor(self, card_id: int):
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO sync_state (key, value) VALUES ('price_cursor', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(card_id),),
+            )
 
     def last_ebay_ingested_at(self, card_id: int) -> str | None:
         """The most recent eBay ingested_at already stored for this card, so

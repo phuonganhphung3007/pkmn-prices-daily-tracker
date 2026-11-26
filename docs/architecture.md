@@ -14,12 +14,11 @@ flowchart TB
 
     subgraph CFG["Config"]
         ENV[".env<br/>API key, catalog share, DB path"]
-        WL[["config/watchlist.csv<br/>card id, tcg_player_id, name, set"]]
     end
 
     subgraph CORE["Shared modules"]
-        COMMON["common.py — ApiClient<br/>retries, credit budget from headers,<br/>allocation caps, load/save JSON"]
-        DBPY["db.py — Store<br/>schema + migrations, upsert cards,<br/>save prices, resume helpers"]
+        COMMON["common.py — ApiClient<br/>retries (incl. connection-level errors),<br/>credit budget from headers, allocation caps"]
+        DBPY["db.py — Store<br/>schema + migrations, upsert cards,<br/>save prices, cross-day cursors"]
     end
 
     subgraph ORCH["Daily entry point"]
@@ -27,19 +26,17 @@ flowchart TB
     end
 
     subgraph TASKS["Tasks"]
-        SAC["sync_all_cards.py — Priority 1<br/>catalog growth, capped at share<br/>List phase then Detail phase"]
-        FP["fetch_prices.py — Priority 2<br/>watchlist prices: rest of pool<br/>+ catalog leftovers"]
+        SAC["sync_all_cards.py — Priority 1<br/>1. List (GET /cards, paged)<br/>2. Detail (GET /cards/:id per queued card)<br/>3. once both caught up: hands leftover<br/>budget to fetch_prices.run()"]
+        FP["fetch_prices.py — Priority 2<br/>prices every card_id in `cards`,<br/>continuing from price_cursor<br/>(wraps to the start once it reaches the end)"]
     end
 
     subgraph TOOLS["Manual / occasional"]
-        BW["build_watchlist.py<br/>search by set, name or TCGplayer id"]
-        BF["backfill_db.py<br/>import legacy master_prices.csv"]
+        BF["backfill_db.py<br/>import an externally-supplied legacy CSV"]
     end
 
     subgraph DATA["data/"]
-        PDB[("pokemon.db — SQLite<br/>cards: one row per card_id<br/>price_history: tcgplayer daily + ebay sales")]
-        PROG["Progress files<br/>.progress-sync-all.json<br/>.progress-YYYY-MM-DD.json"]
-        LEG["Legacy CSVs (no longer written)<br/>master_prices.csv, snapshots/"]
+        PDB[("pokemon.db — SQLite, all three tables<br/>cards: one row per card_id<br/>price_history: tcgplayer daily + ebay sales<br/>sync_state: price_cursor (cross-day)")]
+        PROG[".progress-sync-all.json<br/>tracked in git — must survive across<br/>days for the list/detail phases to resume"]
     end
 
     GA3 --> DS
@@ -49,22 +46,17 @@ flowchart TB
 
     SAC -->|"GET /cards (paged list)<br/>GET /cards/:id"| COMMON
     FP -->|"GET /cards/:id<br/>GET /cards/:id/listings/ebay"| COMMON
-    BW -->|"GET /cards (search)"| COMMON
     COMMON <-->|"HTTPS + credit headers"| API
 
-    WL --> FP
-    BW -->|"append new cards"| WL
-    SAC -. "reuses flatten_card" .-> FP
+    SAC -. "phase 3: calls directly,<br/>same price_cursor" .-> FP
 
     SAC --> DBPY
     FP --> DBPY
     BF --> DBPY
-    LEG --> BF
     DBPY <--> PDB
 
     SAC <--> PROG
-    FP <--> PROG
-    DBPY -. "done_card_ids /<br/>last_ebay_ingested_at (resume)" .-> FP
+    DBPY -. "get/set_price_cursor,<br/>last_ebay_ingested_at (resume)" .-> FP
 
     PDB --> GA4
     PROG --> GA4

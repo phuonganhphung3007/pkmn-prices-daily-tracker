@@ -23,20 +23,25 @@ repo's history and broke the daily workflow's push. The DB doesn't have
 either problem: it's upserted/deduplicated, not appended, and it's the only
 thing committed now.)
 
-Resume support: if the job is interrupted (credit limit hit, network error,
-workflow timeout), data/.progress-YYYY-MM-DD.json remembers which card IDs
-were already fetched today, and pokemon.db is asked which IDs it already holds
-for today (the progress file doesn't survive between CI runs, but the committed
-database does). Re-running the same day picks up where it left off instead of
-re-spending credits. eBay fetches resume separately and incrementally: each
-card's `since` is the newest ingested_at already stored for it, so a later run
-only pays for listings added after the last one it saw.
+Resume support: a single persistent cursor (db.Store.get/set_price_cursor,
+stored in pokemon.db itself so it survives a fresh CI checkout) remembers the
+last card_id attempted, across days — not just within one day. Each run
+continues right after that card, so a run that only gets partway through the
+catalogue today picks up tomorrow exactly where it stopped instead of
+restarting from the first card_id in `cards` (which would otherwise mean the
+back of the catalogue never gets reached at all). Once the cursor reaches the
+last card_id, the next card wraps back around to the first one — so once
+every card has been priced at least once, this naturally becomes a rolling
+daily refresh of the whole catalogue instead of a one-time backfill. eBay
+fetches resume separately and incrementally within that: each card's `since`
+is the newest ingested_at already stored for it, so a later pass over the
+same card only pays for listings added since the last time it was visited.
 """
 
 from datetime import date
 
 import db
-from common import ApiClient, CreditBudgetExhausted, DATA_DIR, load_json, save_json
+from common import ApiClient, CreditBudgetExhausted
 
 EBAY_PAGE_LIMIT = 20
 # Safety cap so one card with an unexpectedly long eBay sales history can't
@@ -142,24 +147,33 @@ def flatten_ebay_listings(card_id: int, listings: list[dict]) -> list[dict]:
 
 
 def run(client: ApiClient, store: db.Store) -> dict:
-    """The price-history task: TCGplayer + eBay listings for every card in
-    `cards` not already done today. Stops early (without raising) if
-    `client` runs out of credits — either the real daily limit, or a soft
-    per-task allocation set via client.set_allocation() by an orchestrator
-    sharing today's budget across multiple tasks. Caller owns the Store's
-    lifecycle."""
+    """The price-history task: TCGplayer + eBay listings for cards in
+    `cards`, continuing from the persistent price_cursor (see module
+    docstring) rather than restarting from the first card_id every run.
+    Stops early (without raising) if `client` runs out of credits — either
+    the real daily limit, or a soft per-task allocation set via
+    client.set_allocation() by an orchestrator sharing today's budget across
+    multiple tasks. Caller owns the Store's lifecycle."""
     today = date.today().isoformat()
-    progress_path = DATA_DIR / f".progress-{today}.json"
-    done_ids = set(load_json(progress_path, []))
-    done_ids |= store.done_card_ids(today)
-
     card_ids = store.all_card_ids()
-    print(f"Catalogue has {len(card_ids)} card(s); {len(done_ids)} already fetched today.")
+    n = len(card_ids)
+    if n == 0:
+        print("No cards in `cards` yet — nothing to price.")
+        return {"fetched": 0, "failed": 0, "remaining": 0, "stopped_early": False}
+
+    cursor = store.get_price_cursor()
+    if cursor is None:
+        start = 0
+        print(f"Catalogue has {n} card(s); no price_cursor yet — starting from the top.")
+    else:
+        # First card_id strictly after the cursor; wraps to 0 if the cursor
+        # was the last (or past the last) card_id in the catalogue.
+        start = next((i for i, cid in enumerate(card_ids) if cid > cursor), 0)
+        print(f"Catalogue has {n} card(s); resuming after card_id {cursor}.")
 
     fetched, failed, stopped_early = 0, 0, False
-    for card_id in card_ids:
-        if card_id in done_ids:
-            continue
+    for offset in range(n):  # at most one full lap per run
+        card_id = card_ids[(start + offset) % n]
 
         try:
             card = client.get(f"/cards/{card_id}")
@@ -170,8 +184,7 @@ def run(client: ApiClient, store: db.Store) -> dict:
         except RuntimeError as e:
             print(f"Skipping card {card_id}: {e}")
             failed += 1
-            done_ids.add(card_id)  # don't retry a permanent error (e.g. 404) all day
-            save_json(progress_path, sorted(done_ids))
+            store.set_price_cursor(card_id)  # move past it either way — don't retry a dead card all day
             continue
 
         rows = flatten_card(card, today)
@@ -182,8 +195,7 @@ def run(client: ApiClient, store: db.Store) -> dict:
             listings = fetch_ebay_listings(client, card_id, since=since)
         except CreditBudgetExhausted as e:
             print(f"Stopping price history — {e}")
-            done_ids.add(card_id)
-            save_json(progress_path, sorted(done_ids))
+            store.set_price_cursor(card_id)
             stopped_early = True
             break
         except RuntimeError as e:
@@ -193,8 +205,7 @@ def run(client: ApiClient, store: db.Store) -> dict:
                 ebay_rows = flatten_ebay_listings(card_id, listings)
                 store.save_prices([db.to_price_history_row(r) for r in ebay_rows])
 
-        done_ids.add(card_id)
-        save_json(progress_path, sorted(done_ids))
+        store.set_price_cursor(card_id)
         fetched += 1
 
         if fetched % 50 == 0:
@@ -206,7 +217,7 @@ def run(client: ApiClient, store: db.Store) -> dict:
     return {
         "fetched": fetched,
         "failed": failed,
-        "remaining": max(0, len(card_ids) - len(done_ids)),
+        "remaining": max(0, n - fetched - failed),
         "stopped_early": stopped_early,
     }
 
@@ -221,7 +232,7 @@ def main():
 
     print(
         f"Done. Fetched {stats['fetched']} card(s), {stats['failed']} failed/skipped, "
-        f"{stats['remaining']} remaining for a future run. "
+        f"{stats['remaining']} left in this lap around the catalogue. "
         f"Credits used today: {client.credits_charged_today}/{client.credits_limit}."
     )
 

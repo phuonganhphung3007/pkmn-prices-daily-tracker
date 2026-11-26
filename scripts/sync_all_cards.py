@@ -219,7 +219,7 @@ def main():
         p = stats["price_stats"]
         print(
             f"Price refresh: fetched {p['fetched']} card(s), {p['failed']} failed/skipped, "
-            f"{p['remaining']} remaining."
+            f"{p['remaining']} left in this lap."
         )
 
     print(f"Credits used today: {client.credits_charged_today}/{client.credits_limit}.")
