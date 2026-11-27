@@ -1,5 +1,11 @@
 name: Daily Pokémon Price Update
 
+# GitHub only honors `schedule:` triggers defined in the repo's default
+# branch (main), so main has its own copy of this file that checks out and
+# pushes back to db-storage explicitly — main's own tree is intentionally
+# left alone by that copy. This copy is for running it manually from the
+# db-storage branch directly (Actions tab -> branch selector -> db-storage).
+
 on:
   schedule:
     # 13:17 UTC daily — arbitrary off-peak minute to avoid the top-of-hour
@@ -8,14 +14,16 @@ on:
   workflow_dispatch: {}  # allows manual "Run workflow" from the Actions tab
 
 permissions:
-  contents: write  # needed to commit the updated CSVs back to the repo
+  contents: write  # needed to commit the updated database back to db-storage
 
 jobs:
   fetch-prices:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repo
+      - name: Check out db-storage branch
         uses: actions/checkout@v4
+        with:
+          ref: db-storage
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -25,15 +33,21 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Fetch today's prices
+      - name: Sync catalog + fetch today's prices into pokemon.db (hosted on Turso)
         env:
           PKMNPRICES_API_KEY: ${{ secrets.PKMNPRICES_API_KEY }}
-        run: python scripts/fetch_prices.py
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: python scripts/daily_sync.py
 
-      - name: Commit updated data
+      # pokemon.db itself is gitignored now — it's an embedded replica of the
+      # Turso-hosted database (see db.py), synced over the network instead of
+      # committed to git. This step only commits data/.progress-sync-all.json
+      # (the catalog-discovery resume tracker, which still lives in git).
+      - name: Commit updated progress tracker
         run: |
           git config user.name "pkmnprices-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add data/
+          git add data/.progress-sync-all.json
           git diff --cached --quiet || git commit -m "Daily price update: $(date -u +'%Y-%m-%d')"
-          git push
+          git push origin HEAD:db-storage
