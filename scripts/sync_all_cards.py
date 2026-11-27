@@ -107,6 +107,7 @@ def list_phase(client, writer, progress, done_ids, max_pages):
                     progress["detail_queue"].append(card_id)
                     queued += 1
         writer.flush()
+        writer.store.sync()  # no-op without Turso; bounds data loss on a crash
 
         total_pages = resp["pagination"]["total_pages"]
         progress["next_page"] = page + 1
@@ -142,6 +143,7 @@ def detail_phase(client, writer, progress, done_ids):
 
             if fetched and fetched % 50 == 0:
                 save_json(PROGRESS_PATH, progress)
+                writer.store.sync()  # no-op without Turso; bounds data loss on a crash
                 print(f"  {fetched} card(s) priced one by one, {len(progress['detail_queue'])} left")
     finally:
         save_json(PROGRESS_PATH, progress)

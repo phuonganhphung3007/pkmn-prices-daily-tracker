@@ -209,6 +209,7 @@ def run(client: ApiClient, store: db.Store) -> dict:
         fetched += 1
 
         if fetched % 50 == 0:
+            store.sync()  # push progress periodically (no-op without Turso) -- bounds data loss on a crash
             print(
                 f"  {fetched} cards fetched "
                 f"(credits used: {client.credits_charged_today}/{client.credits_limit})"

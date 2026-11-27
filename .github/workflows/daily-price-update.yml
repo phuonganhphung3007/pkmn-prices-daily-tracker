@@ -33,15 +33,21 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Sync catalog + fetch today's prices into data/pokemon.db
+      - name: Sync catalog + fetch today's prices into pokemon.db (hosted on Turso)
         env:
           PKMNPRICES_API_KEY: ${{ secrets.PKMNPRICES_API_KEY }}
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
         run: python scripts/daily_sync.py
 
-      - name: Commit updated data
+      # pokemon.db itself is gitignored now — it's an embedded replica of the
+      # Turso-hosted database (see db.py), synced over the network instead of
+      # committed to git. This step only commits data/.progress-sync-all.json
+      # (the catalog-discovery resume tracker, which still lives in git).
+      - name: Commit updated progress tracker
         run: |
           git config user.name "pkmnprices-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add data/
+          git add data/.progress-sync-all.json
           git diff --cached --quiet || git commit -m "Daily price update: $(date -u +'%Y-%m-%d')"
           git push origin HEAD:db-storage

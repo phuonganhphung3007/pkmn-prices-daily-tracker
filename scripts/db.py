@@ -1,6 +1,24 @@
 """
-SQLite storage for card prices: one file, data/pokemon.db (override with
-PKMNPRICES_DB_PATH), with two tables based on data/pokemon.sql:
+SQLite-compatible storage for card prices, with two tables based on
+data/pokemon.sql plus a small sync_state table (see below). Backed by
+libsql, in one of two modes depending on whether TURSO_DATABASE_URL /
+TURSO_AUTH_TOKEN are set:
+
+  - Both set: an embedded replica. Reads/writes still hit a local file
+    (PKMNPRICES_DB_PATH, default data/pokemon.db) at full local speed, but
+    it's synced with a Turso-hosted database via Store.sync() — called once
+    on connect (pull), once more after schema setup (push, for a brand-new
+    database), and periodically by the long-running loops in
+    fetch_prices.py / sync_all_cards.py. The *remote* database is the real
+    source of truth; the local file is a fast, disposable cache of it — in
+    particular it is gitignored and no longer committed, which is what
+    actually fixes the "pokemon.db keeps growing past GitHub's file-size
+    warnings" problem (a committed SQLite file doesn't delta-compress well
+    in git, so it was growing roughly by its own size every day).
+  - Neither set: a plain local file, no networking — for local dev/testing
+    without a Turso account. Store.sync() is then a no-op.
+
+Tables:
 
   cards         - one row per card_id, latest known metadata. Upserted, so it
                   never grows past one row per card. Never holds grade/price
@@ -28,13 +46,16 @@ collapsed away.
 """
 
 import os
-import sqlite3
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+
+import libsql
 
 from common import DATA_DIR
 
 DB_PATH = Path(os.environ.get("PKMNPRICES_DB_PATH", DATA_DIR / "pokemon.db"))
+TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL")
+TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
 
 CARD_COLUMNS = ["card_id", "tcg_player_id", "set_id", "name", "card_number", "rarity", "card_type"]
 PRICE_COLUMNS = [
@@ -189,15 +210,30 @@ class Store:
     def __init__(self, path: Path = DB_PATH):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path)
+        self.replica = bool(TURSO_DATABASE_URL and TURSO_AUTH_TOKEN)
+        if self.replica:
+            self.conn = libsql.connect(
+                str(self.path), sync_url=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN
+            )
+            self.sync()  # pull whatever's already on the remote before touching schema
+        else:
+            self.conn = libsql.connect(str(self.path))
         self.conn.executescript(SCHEMA)
         self._migrate()
+        self.sync()  # push schema (no-op unless this is a brand-new remote database)
+
+    def sync(self):
+        """Reconcile the local replica with the remote Turso database (both
+        directions). A no-op when there's no TURSO_DATABASE_URL/AUTH_TOKEN —
+        callers never need to check self.replica themselves."""
+        if self.replica:
+            self.conn.sync()
 
     def _migrate(self):
         """Add columns introduced after a pre-existing data/pokemon.db was
         first created (CREATE TABLE IF NOT EXISTS above only applies to a
         brand-new file), then rebuild the unique index to match."""
-        existing = {row[1] for row in self.conn.execute("PRAGMA table_info(price_history)")}
+        existing = {row[1] for row in self.conn.execute("PRAGMA table_info(price_history)").fetchall()}
         missing = [c for c in PRICE_HISTORY_NEW_COLUMNS if c not in existing]
         if not missing:
             return
@@ -208,6 +244,7 @@ class Store:
             self.conn.executescript(PRICE_HISTORY_GRAIN_SQL)
 
     def close(self):
+        self.sync()  # push anything a caller forgot to sync before closing
         self.conn.close()
 
     def done_card_ids(self, price_date: str) -> set[int]:
@@ -216,13 +253,13 @@ class Store:
         cur = self.conn.execute(
             "SELECT DISTINCT card_id FROM price_history WHERE price_date = ?", (price_date,)
         )
-        return {r[0] for r in cur}
+        return {r[0] for r in cur.fetchall()}
 
     def all_card_ids(self) -> list[int]:
         """Every card_id already known in `cards`, ascending — the catalogue
         that fetch_prices.py refreshes prices for daily (no more watchlist)."""
         cur = self.conn.execute("SELECT card_id FROM cards ORDER BY card_id")
-        return [r[0] for r in cur]
+        return [r[0] for r in cur.fetchall()]
 
     def get_price_cursor(self) -> int | None:
         """The last card_id fetch_prices.py attempted, across all days —
@@ -260,16 +297,19 @@ class Store:
         if not rows:
             return
         cols = ", ".join(CARD_COLUMNS)
-        params = ", ".join(f":{c}" for c in CARD_COLUMNS)
+        placeholders = ", ".join("?" for _ in CARD_COLUMNS)
         updates = ", ".join(
             f"{c} = COALESCE(excluded.{c}, cards.{c})" for c in CARD_COLUMNS if c != "card_id"
         )
+        # libsql's executemany wants positional (?) params as tuples, not
+        # dicts with named (:col) placeholders — unlike stdlib sqlite3.
+        values = [tuple(r.get(c) for c in CARD_COLUMNS) for r in rows.values()]
         with self.conn:
             self.conn.executemany(
-                f"""INSERT INTO cards ({cols}) VALUES ({params})
+                f"""INSERT INTO cards ({cols}) VALUES ({placeholders})
                     ON CONFLICT(card_id) DO UPDATE SET {updates},
                         updated_at = CURRENT_TIMESTAMP""",
-                list(rows.values()),
+                values,
             )
 
     def save_prices(self, price_rows: list[dict]):
@@ -279,10 +319,11 @@ class Store:
         if not rows:
             return
         cols = ", ".join(PRICE_COLUMNS)
-        params = ", ".join(f":{c}" for c in PRICE_COLUMNS)
+        placeholders = ", ".join("?" for _ in PRICE_COLUMNS)
+        values = [tuple(r.get(c) for c in PRICE_COLUMNS) for r in rows]
         with self.conn:
             self.conn.executemany(
-                f"INSERT OR REPLACE INTO price_history ({cols}) VALUES ({params})", rows
+                f"INSERT OR REPLACE INTO price_history ({cols}) VALUES ({placeholders})", values
             )
 
     def save_flat_rows(self, flat_rows: list[dict]):
